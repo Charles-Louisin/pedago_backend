@@ -16,6 +16,9 @@ const timetableSchema = new Schema(
       },
     ],
     version: { type: Number, default: 1 },
+    /** Plage déjà planifiée (« YYYY-MM-DD ») : évite de recalculer à chaque consultation. */
+    plannedFrom: String,
+    plannedThrough: String,
   },
   { timestamps: true }
 );
@@ -81,7 +84,7 @@ const catchUpItemSchema = new Schema(
     subjectCode: String,
     reason: { type: String, enum: ["missed", "partial"], required: true },
     remainingObjectives: [Number],
-    status: { type: String, enum: ["open", "scheduled", "dropped"], default: "open" },
+    status: { type: String, enum: ["open", "scheduled", "resolved", "dropped"], default: "open" },
     scheduledLessonId: { type: Schema.Types.ObjectId, ref: "LessonInstance" },
   },
   { timestamps: true }

@@ -19,6 +19,7 @@ import {
   Subject,
   TeacherProfile,
   User,
+  Session,
   type ResourceStatus,
 } from "../models/index.js";
 import { requireAuth, requireRole, type AuthedRequest } from "../middleware/auth.js";
@@ -27,7 +28,7 @@ import { ah, badRequest, forbidden, notFound } from "../utils/http-error.js";
 import { lessonContentSchema, deterministicChecks } from "../services/content-schema.js";
 import { buildLibraryParams, extractParams, generateParams, STEPS } from "../ai/pipeline.js";
 import { env } from "../config/env.js";
-import { isAllowedHost } from "../ai/safe-fetch.js";
+import { isAllowedHost, isUploadThingUrl } from "../ai/safe-fetch.js";
 
 export const adminRouter = Router();
 adminRouter.use(requireAuth, requireRole("reviewer", "admin"));
@@ -80,8 +81,9 @@ adminRouter.get(
 const sourceSchema = z.object({
   title: z.string().trim().min(3).max(240),
   issuer: z.string().trim().min(2).max(160),
-  url: z.string().url().optional(),
-  fileUrl: z.string().url().optional(),
+  url: z.string().url().refine((u) => /^https?:\/\//i.test(u), "Adresse web http(s) attendue").optional(),
+  /** Fichier envoyé via UploadThing uniquement (jamais une URL arbitraire). */
+  fileUrl: z.string().url().refine(isUploadThingUrl, "Fichier attendu depuis le stockage PEDAGO").optional(),
   fileKey: z.string().max(200).optional(),
   publishedOn: z.string().max(20).optional(),
   reference: z.string().max(200).optional(),
@@ -275,6 +277,7 @@ adminRouter.post(
       durationMin: node.durationMin,
       curriculumVersion: node.curriculumVersion,
       origin: "human",
+      lastEditedBy: me(req).userId,
       status: "DRAFT",
     });
     await audit(req, "resource.create", String(r._id));
@@ -292,7 +295,7 @@ adminRouter.put(
     if (["PUBLISHED", "APPROVED", "ARCHIVED"].includes(r.status)) {
       throw badRequest("LOCKED", "Ressource verrouillée : crée une révision pour la modifier");
     }
-    Object.assign(r, req.body);
+    Object.assign(r, req.body, { lastEditedBy: me(req).userId });
     await r.save();
     await audit(req, "resource.update", String(r._id));
     res.json({ resource: r, checks: deterministicChecks(lessonContentSchema.parse(r.content)) });
@@ -301,11 +304,13 @@ adminRouter.put(
 
 adminRouter.post(
   "/resources/:id/revise",
+  requireRole("admin"),
   ah(async (req, res) => {
     const r = await Resource.findById(req.params.id);
     if (!r) throw notFound();
     if (r.status !== "PUBLISHED") throw badRequest("NOT_PUBLISHED", "Seule une ressource publiée peut être révisée");
     r.status = "HUMAN_REVIEW";
+    r.lastEditedBy = me(req).userId as any;
     r.contentVersion += 1;
     r.approvedAt = undefined;
     r.approvedBy = undefined;
@@ -324,8 +329,12 @@ adminRouter.post(
     const to = req.body.to as ResourceStatus;
     const from = r.status as ResourceStatus;
     if (!STATUS_TRANSITIONS[from].includes(to)) throw badRequest("BAD_TRANSITION", `Transition ${from} → ${to} interdite`);
-    if (to === "PUBLISHED" && me(req).role !== "admin") throw forbidden("ADMIN_ONLY", "Seul un administrateur publie");
+    if ((to === "PUBLISHED" || to === "ARCHIVED") && me(req).role !== "admin") throw forbidden("ADMIN_ONLY", "Seul un administrateur publie ou archive");
     if (to === "APPROVED") {
+      // Principe des quatre yeux : on ne valide pas son propre travail.
+      if (r.lastEditedBy && String(r.lastEditedBy) === me(req).userId) {
+        throw forbidden("SELF_APPROVAL", "Une autre personne doit valider cette ressource");
+      }
       const blocking = deterministicChecks(lessonContentSchema.parse(r.content)).filter((i) => i.severity === "error");
       if (blocking.length) throw badRequest("CHECKS_FAILED", blocking.map((b) => b.message).join(" · "));
       if (!r.sources.length && r.origin === "ai") throw badRequest("NO_SOURCE", "Une ressource IA doit citer au moins une source");
@@ -389,6 +398,7 @@ adminRouter.post(
   validate(jobSchema),
   ah(async (req, res) => {
     const body = req.body as z.infer<typeof jobSchema>;
+    if (!env.openrouterApiKey) throw badRequest("AI_NOT_CONFIGURED", "Clé OpenRouter non configurée : aucune tâche IA ne peut être lancée");
     const job = await AiJob.create({
       kind: body.kind,
       params: body.params,
@@ -510,6 +520,10 @@ adminRouter.patch(
     if (req.params.id === me(req).userId) throw badRequest("SELF_EDIT", "Tu ne peux pas modifier ton propre rôle");
     const u = await User.findByIdAndUpdate(req.params.id, req.body, { new: true }).select("fullName email role disabled").lean();
     if (!u) throw notFound();
+    // Compte désactivé ou rôle modifié : toutes ses sessions sont fermées immédiatement.
+    if (req.body.disabled === true || req.body.role) {
+      await Session.updateMany({ userId: u._id, revokedAt: null }, { revokedAt: new Date() });
+    }
     await audit(req, "user.update", String(u._id), req.body);
     res.json(u);
   })

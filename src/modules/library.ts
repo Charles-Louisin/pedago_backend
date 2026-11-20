@@ -55,7 +55,8 @@ libraryRouter.get(
       CurriculumNode.findById(r.nodeId).select("title objectives curriculumVersion").lean(),
       SourceDocument.find({ _id: { $in: r.sources.map((s) => s.sourceId) } }).select("title issuer url publishedOn consultedAt reference").lean(),
     ]);
-    res.set("ETag", `W/"${r._id}-${r.contentVersion}"`);
+    // Revalidation légère : 304 sans corps si la version n'a pas changé.
+    res.set({ ETag: `W/"${r._id}-${r.contentVersion}"`, "Cache-Control": "private, no-cache" });
     if (req.fresh) return res.status(304).end();
     res.json({
       id: String(r._id),
@@ -133,10 +134,10 @@ libraryRouter.post(
     }
     const nodeIds = await CurriculumNode.distinct("_id", nodeFilter);
     const resources = await Resource.find({ nodeId: { $in: nodeIds }, status: "PUBLISHED" })
-      .select("_id type title nodeId contentVersion content assets.pdf.sizeBytes assets.pdf.contentVersion assets.docx.sizeBytes")
+      .select("_id type title nodeId contentVersion contentBytes assets.pdf.sizeBytes assets.pdf.contentVersion")
       .lean();
     const items = resources.map((r) => {
-      const jsonBytes = Buffer.byteLength(JSON.stringify(r.content));
+      const jsonBytes = r.contentBytes ?? 0;
       const pdfBytes = r.assets?.pdf?.contentVersion === r.contentVersion ? r.assets.pdf.sizeBytes ?? 0 : 0;
       return { id: String(r._id), type: r.type, title: r.title, nodeId: String(r.nodeId), contentVersion: r.contentVersion, jsonBytes, pdfBytes };
     });

@@ -17,9 +17,13 @@ export async function connectDb() {
     logger.info("MongoDB connecté");
   } catch (err) {
     if (!env.mongoMemoryFallback) throw err;
-    logger.warn("MongoDB injoignable : démarrage d'une base en mémoire (développement, données non persistées)");
+    logger.warn("MongoDB injoignable : démarrage d'une base locale de développement (.data/mongo)");
     const { MongoMemoryServer } = await import("mongodb-memory-server");
-    const server = await MongoMemoryServer.create();
+    const fs = await import("node:fs");
+    const dbPath = `${process.cwd()}/.data/mongo`;
+    fs.mkdirSync(dbPath, { recursive: true });
+    // Données conservées entre deux redémarrages (nodemon) pour ne pas perdre les comptes de test.
+    const server = await MongoMemoryServer.create({ instance: { dbPath, storageEngine: "wiredTiger", port: 27027 } });
     memoryServer = server;
     await mongoose.connect(server.getUri("pedago"), options);
     const { seedDatabase } = await import("../seed/seed.js");

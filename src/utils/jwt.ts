@@ -6,11 +6,11 @@ export type Role = "teacher" | "reviewer" | "admin";
 export type AccessPayload = { sub: string; role: Role; sid: string };
 
 export function signAccessToken(payload: AccessPayload) {
-  return jwt.sign(payload, env.jwtSecret, { expiresIn: env.accessTokenTtlSec, issuer: "pedago-api" });
+  return jwt.sign(payload, env.jwtSecret, { expiresIn: env.accessTokenTtlSec, issuer: "pedago-api", algorithm: "HS256" });
 }
 
 export function verifyAccessToken(token: string) {
-  return jwt.verify(token, env.jwtSecret, { issuer: "pedago-api" }) as AccessPayload & jwt.JwtPayload;
+  return jwt.verify(token, env.jwtSecret, { issuer: "pedago-api", algorithms: ["HS256"] }) as AccessPayload & jwt.JwtPayload;
 }
 
 /** Jeton de rafraîchissement opaque : seul son empreinte SHA-256 est stockée en base. */

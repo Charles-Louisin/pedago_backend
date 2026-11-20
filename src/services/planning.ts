@@ -32,25 +32,26 @@ export async function ensurePlan(teacherId: string, classLevel: string, schoolYe
     getCalendar(schoolYear),
   ]);
   if (!timetable || timetable.slots.length === 0) return 0;
+  // Déjà planifié sur cette plage : aucun calcul (cas le plus fréquent, à chaque ouverture de l'app).
+  if (timetable.plannedFrom && timetable.plannedThrough && timetable.plannedFrom <= from && to <= timetable.plannedThrough) return 0;
 
   const subjects = [...new Set(timetable.slots.map((s) => s.subjectCode))];
-  const existing = await LessonInstance.find({ teacherId, classLevel, date: { $gte: from, $lte: to } })
-    .select("date start subjectCode")
-    .lean();
-  const taken = new Set(existing.map((l) => `${l.date}|${l.start}`));
-
-  const cursors = new Map<string, { nodes: Awaited<ReturnType<typeof lessonNodes>>; next: number }>();
-  for (const subjectCode of subjects) {
-    const nodes = await lessonNodes(classLevel, subjectCode);
+  // 3 requêtes au total, quel que soit le nombre de matières.
+  const [existing, allNodes, plannedRows] = await Promise.all([
+    LessonInstance.find({ teacherId, classLevel, date: { $gte: from, $lte: to } }).select("date start").lean(),
+    CurriculumNode.find({ classLevel, subjectCode: { $in: subjects }, kind: "lesson", status: { $ne: "retired" } })
+      .sort({ order: 1 })
+      .select("_id subjectCode")
+      .lean(),
     // Les leçons déjà attribuées (hors annulées) ne sont pas redistribuées.
-    const planned = await LessonInstance.distinct("nodeId", {
-      teacherId,
-      classLevel,
-      subjectCode,
-      origin: "plan",
-      status: { $ne: "cancelled" },
-    });
-    const plannedSet = new Set(planned.map(String));
+    LessonInstance.find({ teacherId, classLevel, origin: "plan", status: { $ne: "cancelled" } }).select("nodeId -_id").lean(),
+  ]);
+  const taken = new Set(existing.map((l) => `${l.date}|${l.start}`));
+  const plannedSet = new Set(plannedRows.map((r) => String(r.nodeId)));
+
+  const cursors = new Map<string, { nodes: { _id: unknown }[]; next: number }>();
+  for (const subjectCode of subjects) {
+    const nodes = allNodes.filter((n) => n.subjectCode === subjectCode);
     const firstFree = nodes.findIndex((n) => !plannedSet.has(String(n._id)));
     cursors.set(subjectCode, { nodes, next: firstFree === -1 ? nodes.length : firstFree });
   }
@@ -80,6 +81,14 @@ export async function ensurePlan(teacherId: string, classLevel: string, schoolYe
     }
   }
   if (docs.length) await LessonInstance.insertMany(docs, { ordered: false });
+  const plannedFrom = timetable.plannedFrom && timetable.plannedFrom < from ? timetable.plannedFrom : from;
+  const plannedThrough = timetable.plannedThrough && timetable.plannedThrough > to ? timetable.plannedThrough : to;
+  // Le repère n'est étendu que si la plage est contiguë à celle déjà planifiée.
+  const contiguous = !timetable.plannedThrough || (from <= addDays(timetable.plannedThrough, 1) && to >= addDays(timetable.plannedFrom ?? from, -1));
+  await Timetable.updateOne(
+    { _id: timetable._id },
+    contiguous ? { plannedFrom, plannedThrough } : { plannedFrom: from, plannedThrough: to }
+  );
   return docs.length;
 }
 
@@ -215,5 +224,7 @@ export async function applyCatchUp(teacherId: string, itemId: string, option: Op
   item.status = "scheduled";
   item.scheduledLessonId = target._id;
   await item.save();
+  // La leçon repoussée en fin de chaîne doit être replacée : on invalide le repère de planification.
+  await Timetable.updateMany({ teacherId, classLevel: target.classLevel }, { $unset: { plannedFrom: 1, plannedThrough: 1 } });
   return { status: "scheduled" as const, lessonId: String(target._id) };
 }

@@ -24,6 +24,8 @@ const sessionSchema = new Schema(
   {
     userId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
     refreshHash: { type: String, required: true, unique: true },
+    /** Empreintes des jetons déjà utilisés (détection de réutilisation). */
+    usedHashes: { type: [String], index: true, default: [] },
     device: { type: String, maxlength: 120 },
     expiresAt: { type: Date, required: true },
     revokedAt: Date,

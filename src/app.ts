@@ -1,3 +1,4 @@
+import "./utils/zod-fr.js";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -37,13 +38,33 @@ export function createApp() {
   app.use(cors({ origin: (origin, cb) => cb(null, !origin || isAllowedOrigin(origin)), credentials: false }));
   app.use(compression());
   app.use(express.json({ limit: "1mb" }));
-  app.use(pinoHttp({ logger, autoLogging: { ignore: (req: { url?: string }) => req.url?.startsWith("/api/v1/health") ?? false } }));
+  // Journaux compacts : méthode, route, statut, durée (pas d'en-têtes complets : plus léger et sans données sensibles).
+  app.use(
+    pinoHttp({
+      logger,
+      autoLogging: { ignore: (req: { url?: string }) => req.url?.startsWith("/api/v1/health") ?? false },
+      serializers: {
+        req: (req: { id: unknown; method: string; url: string }) => ({ id: req.id, method: req.method, url: req.url?.split("?")[0] }),
+        res: (res: { statusCode: number }) => ({ statusCode: res.statusCode }),
+      },
+      customLogLevel: (_req, res, err) => (err || res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info"),
+    })
+  );
 
-  if (env.rateLimitMax > 0) {
-    app.use("/api/v1", rateLimit({ windowMs: env.rateLimitWindowMs, max: env.rateLimitMax, standardHeaders: true, legacyHeaders: false }));
-  }
-  const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 40, standardHeaders: true, legacyHeaders: false });
-  app.use(["/api/v1/auth/login", "/api/v1/auth/register", "/api/v1/auth/refresh"], authLimiter);
+  const limiter = (windowMs: number, max: number, keyGenerator?: (req: express.Request) => string) =>
+    rateLimit({ windowMs, max, standardHeaders: true, legacyHeaders: false, ...(keyGenerator ? { keyGenerator } : {}) });
+
+  if (env.rateLimitMax > 0) app.use("/api/v1", limiter(env.rateLimitWindowMs, env.rateLimitMax));
+  // Beaucoup d'enseignants partagent la même IP (réseau mobile, école) : limites par IP larges,
+  // et limite stricte par identifiant pour bloquer le bourrage d'identifiants sur un compte.
+  app.use(["/api/v1/auth/login", "/api/v1/auth/register"], limiter(15 * 60_000, 200));
+  app.use(
+    "/api/v1/auth/login",
+    limiter(15 * 60_000, 10, (req) => `id:${String(req.body?.identifier ?? "").toLowerCase().slice(0, 160)}`)
+  );
+  app.use("/api/v1/auth/refresh", limiter(15 * 60_000, 600));
+  // Génération de PDF/Word : opération coûteuse, limitée par utilisateur authentifié.
+  app.use(/^\/api\/v1\/library\/resources\/[^/]+\/export\//, limiter(10 * 60_000, 60, (req) => `exp:${req.header("authorization")?.slice(-24) ?? req.ip}`));
 
   app.get("/api/v1/health", (_req, res) => res.json({ status: "ok", time: new Date().toISOString() }));
   app.get("/api/v1/health/ready", (_req, res) => {

@@ -53,9 +53,9 @@ const profileSchema = z
   .object({
     subsystem: z.enum(["francophone", "anglophone"]),
     teachingLanguage: z.enum(["fr", "en"]),
-    schoolName: z.string().trim().max(160).optional(),
-    region: z.string().trim().max(80).optional(),
-    division: z.string().trim().max(80).optional(),
+    schoolName: z.string().trim().max(160).nullish().transform((v) => v || undefined),
+    region: z.string().trim().max(80).nullish().transform((v) => v || undefined),
+    division: z.string().trim().max(80).nullish().transform((v) => v || undefined),
     schoolYear: z.string().regex(/^\d{4}-\d{4}$/),
     assignments: z
       .array(z.object({ classLevel: z.enum(ALL_CLASS_LEVELS), subjects: z.array(z.string().max(40)).min(1).max(20) }))
@@ -81,7 +81,9 @@ teacherRouter.put(
   ah(async (req, res) => {
     const body = req.body as z.infer<typeof profileSchema>;
     const existing = await TeacherProfile.findOne({ userId: uid(req) });
-    const preferences = { ...(existing?.preferences ?? {}), ...(body.preferences ?? {}) };
+    // Valeurs par défaut explicites, puis préférences existantes, puis nouvelles (fusion sur des objets simples).
+    const current = (existing?.toObject().preferences ?? {}) as Record<string, unknown>;
+    const preferences = { difficulty: "standard", illustrationLevel: "simple", wifiOnlyDownloads: false, lowInkExports: true, ...current, ...(body.preferences ?? {}) };
     const profile = await TeacherProfile.findOneAndUpdate(
       { userId: uid(req) },
       { ...body, preferences, $setOnInsert: { userId: uid(req) }, onboardingCompletedAt: existing?.onboardingCompletedAt ?? new Date() },
@@ -144,7 +146,7 @@ teacherRouter.put(
     assertTeaches(profile, classLevel);
     const tt = await Timetable.findOneAndUpdate(
       { teacherId: uid(req), classLevel, schoolYear: profile.schoolYear },
-      { slots, $inc: { version: 1 } },
+      { slots, $inc: { version: 1 }, $unset: { plannedFrom: 1, plannedThrough: 1 } },
       { upsert: true, new: true }
     ).lean();
     // Les séances futures encore « prévues » sont recalculées avec le nouvel emploi du temps.
@@ -202,7 +204,7 @@ teacherRouter.get(
   validate(rangeSchema, "query"),
   ah(async (req, res) => {
     const { from, to, classLevel } = req.query as unknown as z.infer<typeof rangeSchema>;
-    if (from > to || addDays(from, 400) < to) throw badRequest("BAD_RANGE", "Plage de dates invalide");
+    if (from > to || addDays(from, 120) < to) throw badRequest("BAD_RANGE", "Plage de dates invalide (120 jours maximum)");
     const profile = await profileOf(uid(req));
     const classes = classLevel ? [classLevel] : profile.assignments.map((a) => a.classLevel);
     for (const c of classes) {
@@ -271,43 +273,73 @@ teacherRouter.post(
     const lessons = new Map(owned.map((l) => [String(l._id), l]));
     const acks: { opId: string; status: "applied" | "duplicate" | "rejected"; reason?: string }[] = [];
 
-    for (const e of events) {
-      const lesson = lessons.get(e.lessonId);
-      if (!lesson) {
-        acks.push({ opId: e.opId, status: "rejected", reason: "LESSON_NOT_FOUND" });
-        continue;
+    const valid = events.filter((e) => {
+      if (lessons.has(e.lessonId)) return true;
+      acks.push({ opId: e.opId, status: "rejected", reason: "LESSON_NOT_FOUND" });
+      return false;
+    });
+
+    // 1. Doublons : opId déjà reçu précédemment, ou répété dans ce même lot (seule la 1re occurrence compte).
+    const known = new Set(
+      (await ProgressEvent.find({ teacherId, opId: { $in: valid.map((e) => e.opId) } }).select("opId -_id").lean()).map((e) => e.opId)
+    );
+    const duplicates = new Set<number>();
+    const fresh: typeof valid = [];
+    const seen = new Set<string>();
+    valid.forEach((e, i) => {
+      if (known.has(e.opId) || seen.has(e.opId)) duplicates.add(i);
+      else {
+        seen.add(e.opId);
+        fresh.push(e);
       }
+    });
+    if (fresh.length) {
       try {
-        await ProgressEvent.create({ ...e, teacherId, recordedAt: new Date(e.recordedAt) });
+        await ProgressEvent.insertMany(fresh.map((e) => ({ ...e, teacherId, recordedAt: new Date(e.recordedAt) })), { ordered: false });
       } catch (err: any) {
-        if (err?.code === 11000) {
-          acks.push({ opId: e.opId, status: "duplicate" });
-          continue;
-        }
-        throw err;
+        // Course entre deux envois simultanés : la contrainte d'unicité garantit qu'aucun événement n'est compté deux fois.
+        if (!(err?.writeErrors ?? []).every((we: any) => (we.code ?? we.err?.code) === 11000)) throw err;
       }
-      // L'état de la séance reflète l'événement le plus récent (ordre de saisie sur l'appareil).
-      const latest = await ProgressEvent.findOne({ teacherId, lessonId: e.lessonId }).sort({ recordedAt: -1 }).lean();
-      if (latest?.opId === e.opId) {
+    }
+    valid.forEach((e, i) => acks.push({ opId: e.opId, status: duplicates.has(i) ? "duplicate" : "applied" }));
+
+    // 2. Pour chaque séance touchée, l'état reflète l'événement le plus récent (une seule requête).
+    const touched = [...new Set(fresh.map((e) => e.lessonId))];
+    if (touched.length) {
+      const latest = await ProgressEvent.aggregate<{ _id: unknown; ev: { status: "done" | "partial" | "missed"; objectivesDone?: number[] } }>([
+        { $match: { teacherId: owned[0].teacherId, lessonId: { $in: touched.map((id) => owned.find((l) => String(l._id) === id)!._id) } } },
+        { $sort: { recordedAt: -1 } },
+        { $group: { _id: "$lessonId", ev: { $first: "$$ROOT" } } },
+      ]);
+      const lessonOps: any[] = [];
+      const catchOps: any[] = [];
+      for (const { _id, ev } of latest) {
+        const lesson = lessons.get(String(_id))!;
         const total = lesson.nodeId?.objectives?.length ?? 0;
-        const remaining =
-          e.status === "partial" ? [...Array(total).keys()].filter((i) => !(e.objectivesDone ?? []).includes(i)) : e.status === "missed" ? [...Array(total).keys()] : [];
-        await LessonInstance.updateOne({ _id: e.lessonId, teacherId }, { status: e.status, remainingObjectives: remaining, $inc: { rev: 1 } });
-        if (e.status === "done") {
-          await CatchUpItem.updateOne({ teacherId, lessonId: e.lessonId, status: "open" }, { status: "dropped" });
-          if (lesson.catchUpOf) await CatchUpItem.updateOne({ teacherId, lessonId: lesson.catchUpOf }, { status: "scheduled" });
+        const all = [...Array(total).keys()];
+        const remaining = ev.status === "partial" ? all.filter((i) => !(ev.objectivesDone ?? []).includes(i)) : ev.status === "missed" ? all : [];
+        lessonOps.push({ updateOne: { filter: { _id, teacherId }, update: { status: ev.status, remainingObjectives: remaining, $inc: { rev: 1 } } } });
+        if (ev.status === "done") {
+          catchOps.push({ updateOne: { filter: { teacherId, lessonId: _id, status: "open" }, update: { status: "resolved" } } });
+          // Une séance de rattrapage faite clôt l'élément d'origine.
+          if (lesson.catchUpOf) catchOps.push({ updateOne: { filter: { teacherId, lessonId: lesson.catchUpOf }, update: { status: "resolved" } } });
         } else {
-          await CatchUpItem.updateOne(
-            { teacherId, lessonId: e.lessonId },
-            {
-              $set: { reason: e.status, remainingObjectives: remaining, status: "open" },
-              $setOnInsert: { nodeId: lesson.nodeId?._id, classLevel: lesson.classLevel, subjectCode: lesson.subjectCode },
+          catchOps.push({
+            updateOne: {
+              filter: { teacherId, lessonId: _id },
+              update: {
+                $set: { reason: ev.status, remainingObjectives: remaining, status: "open" },
+                $setOnInsert: { nodeId: lesson.nodeId?._id, classLevel: lesson.classLevel, subjectCode: lesson.subjectCode },
+              },
+              upsert: true,
             },
-            { upsert: true }
-          );
+          });
         }
       }
-      acks.push({ opId: e.opId, status: "applied" });
+      await Promise.all([
+        lessonOps.length ? LessonInstance.bulkWrite(lessonOps, { ordered: false }) : null,
+        catchOps.length ? CatchUpItem.bulkWrite(catchOps, { ordered: false }) : null,
+      ]);
     }
     res.json({ acks, serverTime: new Date().toISOString() });
   })

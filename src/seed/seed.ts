@@ -228,5 +228,7 @@ export async function seedDatabase() {
       await Timetable.create({ teacherId: user._id, classLevel: "CP", schoolYear: "2026-2027", slots });
     }
   }
+  // Rattrapage des tailles de contenu pour les ressources créées avant ce champ.
+  await Resource.updateMany({ $or: [{ contentBytes: { $exists: false } }, { contentBytes: 0 }] }, [{ $set: { contentBytes: { $bsonSize: "$content" } } }]);
   logger.info("Données de démonstration prêtes");
 }

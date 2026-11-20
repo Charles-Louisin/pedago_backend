@@ -129,7 +129,20 @@ async function renderDocx(d: Doc): Promise<Buffer> {
 }
 
 /** Génère l'export une seule fois par version de contenu, puis le réutilise pour tous les enseignants. */
-export async function ensureExport(resourceId: string, format: "pdf" | "docx") {
+const inFlight = new Map<string, Promise<unknown>>();
+
+/** Plusieurs enseignants demandant le même export en même temps partagent une seule génération. */
+export function ensureExport(resourceId: string, format: "pdf" | "docx") {
+  const key = resourceId + ":" + format;
+  let p = inFlight.get(key) as ReturnType<typeof generateExport> | undefined;
+  if (!p) {
+    p = generateExport(resourceId, format).finally(() => inFlight.delete(key));
+    inFlight.set(key, p);
+  }
+  return p;
+}
+
+async function generateExport(resourceId: string, format: "pdf" | "docx") {
   const r = await Resource.findById(resourceId);
   if (!r || r.status !== "PUBLISHED") return null;
   const existing = r.assets?.[format];

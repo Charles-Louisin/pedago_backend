@@ -28,6 +28,11 @@ export async function chat(input: ChatInput) {
   const job = await AiJob.findById(input.jobId).select("budgetUsd spentUsd").lean();
   if (!job) throw new Error("Tâche IA introuvable");
   if (job.spentUsd >= job.budgetUsd) throw new BudgetExceededError(`Budget atteint (${job.spentUsd.toFixed(3)} $)`);
+  const since = new Date(Date.now() - 86_400_000);
+  const [day] = await AiUsageLog.aggregate([{ $match: { createdAt: { $gte: since } } }, { $group: { _id: null, cost: { $sum: "$costUsd" } } }]);
+  if ((day?.cost ?? 0) >= env.aiDailyBudgetUsd) {
+    throw new BudgetExceededError(`Plafond quotidien atteint (${env.aiDailyBudgetUsd} $ sur 24 h)`);
+  }
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), env.aiRequestTimeoutMs);

@@ -24,6 +24,7 @@ const resourceSchema = new Schema(
     sources: [{ _id: false, sourceId: { type: Schema.Types.ObjectId, ref: "SourceDocument" }, pages: [Number], note: String }],
     curriculumVersion: { type: String, required: true },
     contentVersion: { type: Number, default: 1 },
+    contentBytes: { type: Number, default: 0 },
     schemaVersion: { type: Number, default: 1 },
     status: { type: String, enum: RESOURCE_STATUSES, default: "DRAFT" },
     origin: { type: String, enum: ["ai", "human", "seed"], default: "ai" },
@@ -36,6 +37,8 @@ const resourceSchema = new Schema(
       model: String,
       checkedAt: Date,
     },
+    /** Dernière personne ayant modifié le contenu (interdite de validation : principe des quatre yeux). */
+    lastEditedBy: { type: Schema.Types.ObjectId, ref: "User" },
     approvedBy: { type: Schema.Types.ObjectId, ref: "User" },
     approvedAt: Date,
     publishedAt: Date,
@@ -43,7 +46,12 @@ const resourceSchema = new Schema(
   },
   { timestamps: true, minimize: false }
 );
+// Taille du contenu précalculée : les manifestes de téléchargement ne chargent pas le contenu.
+resourceSchema.pre("save", function () {
+  if (this.isModified("content")) this.set("contentBytes", Buffer.byteLength(JSON.stringify(this.get("content") ?? {})));
+});
 resourceSchema.index({ subsystem: 1, classLevel: 1, subjectCode: 1, status: 1 });
+resourceSchema.index({ nodeId: 1, status: 1, type: 1 });
 resourceSchema.index({ classLevel: 1, subjectCode: 1, nodeId: 1 });
 resourceSchema.index({ type: 1, status: 1 });
 resourceSchema.index({ generationKey: 1 }, { sparse: true });

@@ -127,14 +127,25 @@ authRouter.post(
   validate(z.object({ refreshToken: z.string().min(20).max(200) })),
   ah(async (req, res) => {
     const hash = hashToken(req.body.refreshToken);
-    const session = await Session.findOne({ refreshHash: hash });
-    if (!session || session.revokedAt || session.expiresAt < new Date()) throw unauthorized("Session expirée");
+    const refreshToken = newRefreshToken();
+    // Rotation atomique : un même jeton ne peut servir qu'une fois, même en cas de requêtes simultanées.
+    const session = await Session.findOneAndUpdate(
+      { refreshHash: hash, revokedAt: null, expiresAt: { $gt: new Date() } },
+      { refreshHash: hashToken(refreshToken), lastUsedAt: new Date(), $push: { usedHashes: { $each: [hash], $slice: -10 } } },
+      { new: true }
+    );
+    if (!session) {
+      // Réutilisation d'un ancien jeton : signe probable de vol → toute la session est révoquée.
+      // Tolérance de 20 s : deux requêtes simultanées du même appareil ne sont pas une attaque.
+      const stolen = await Session.findOneAndUpdate(
+        { usedHashes: hash, revokedAt: null, lastUsedAt: { $lt: new Date(Date.now() - 20_000) } },
+        { revokedAt: new Date() }
+      );
+      if (stolen) await AuditLog.create({ actorId: stolen.userId, action: "auth.refresh_reuse", target: String(stolen._id), ip: req.ip });
+      throw unauthorized("Session expirée");
+    }
     const user = await User.findById(session.userId).lean();
     if (!user || user.disabled) throw unauthorized("Session expirée");
-    const refreshToken = newRefreshToken();
-    session.refreshHash = hashToken(refreshToken);
-    session.lastUsedAt = new Date();
-    await session.save();
     const accessToken = signAccessToken({ sub: String(user._id), role: user.role as Role, sid: String(session._id) });
     res.json({ accessToken, refreshToken, expiresIn: env.accessTokenTtlSec });
   })

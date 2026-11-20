@@ -42,6 +42,10 @@ export const env = {
   aiModelWrite: str("AI_MODEL_WRITE", "anthropic/claude-sonnet-4.5"),
   aiModelReview: str("AI_MODEL_REVIEW", "openai/gpt-5-mini"),
   aiJobDefaultBudgetUsd: num("AI_JOB_DEFAULT_BUDGET_USD", 2),
+  /** Plafond global de dépense IA sur 24 h glissantes (toutes tâches confondues). */
+  aiDailyBudgetUsd: num("AI_DAILY_BUDGET_USD", 20),
+  /** Nombre maximal de générations créées par une production « bibliothèque ». */
+  aiMaxJobsPerBuild: num("AI_MAX_JOBS_PER_BUILD", 300),
   aiRequestTimeoutMs: num("AI_REQUEST_TIMEOUT_MS", 180_000),
   aiWorkerConcurrency: num("AI_WORKER_CONCURRENCY", 2),
   aiWorkerPollMs: num("AI_WORKER_POLL_MS", 4_000),

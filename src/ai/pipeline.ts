@@ -104,7 +104,13 @@ const handlers: Record<string, (ctx: StepCtx) => Promise<StepResult>> = {
       illustrationLevel: p.illustrationLevel,
       curriculumVersion: node.curriculumVersion,
     });
-    const existing = await Resource.findOne({ generationKey: key, status: { $nin: ["REJECTED", "ARCHIVED"] } }).select("_id").lean();
+    // Une ressource équivalente (même leçon, type et variante) suffit, même créée à la main ou par une ancienne version de prompt.
+    const existing = await Resource.findOne({
+      status: { $nin: ["REJECTED", "ARCHIVED"] },
+      $or: [{ generationKey: key }, { nodeId: p.nodeId, type: p.type, difficulty: p.difficulty, illustrationLevel: p.illustrationLevel }],
+    })
+      .select("_id")
+      .lean();
     if (existing && !p.force) {
       // Aucune dépense : la ressource existe déjà dans la bibliothèque.
       job.resultResourceIds = [existing._id];
@@ -364,10 +370,18 @@ const handlers: Record<string, (ctx: StepCtx) => Promise<StepResult>> = {
 
   async enqueue_generations({ job, outputs }) {
     const p = buildLibraryParams.parse(job.params);
+    const nodeIds = outputs.list_nodes.nodeIds as string[];
+    // On ne crée pas de tâche pour ce qui existe déjà (évite des milliers de tâches inutiles).
+    const existing = await Resource.find({ nodeId: { $in: nodeIds }, type: { $in: p.types }, status: { $nin: ["REJECTED", "ARCHIVED"] }, illustrationLevel: "simple" })
+      .select("nodeId type difficulty")
+      .lean();
+    const have = new Set(existing.map((r) => `${r.nodeId}|${r.type}|${r.difficulty}`));
     const docs = [];
-    for (const nodeId of outputs.list_nodes.nodeIds as string[])
+    for (const nodeId of nodeIds)
       for (const type of p.types)
-        for (const difficulty of p.difficulties)
+        for (const difficulty of p.difficulties) {
+          if (have.has(`${nodeId}|${type}|${difficulty}`)) continue;
+          if (docs.length >= env.aiMaxJobsPerBuild) break;
           docs.push({
             kind: "generate_resource",
             params: { nodeId, type, difficulty, illustrationLevel: "simple", sourceIds: [], force: false },
@@ -375,6 +389,7 @@ const handlers: Record<string, (ctx: StepCtx) => Promise<StepResult>> = {
             budgetUsd: p.perJobBudgetUsd,
             createdBy: job.createdBy,
           });
+        }
     // Chaque génération est une petite tâche reprenable ; check_cache évite les doublons.
     if (docs.length) await AiJob.insertMany(docs);
     return { output: { enqueued: docs.length }, finalStatus: "done" };
