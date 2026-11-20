@@ -1,0 +1,414 @@
+import crypto from "node:crypto";
+import { z } from "zod";
+import { env } from "../config/env.js";
+import {
+  AiJob,
+  CurriculumNode,
+  Resource,
+  SourceDocument,
+  Subject,
+  type AiJobKind,
+  RESOURCE_TYPES,
+  DIFFICULTIES,
+  ILLUSTRATION_LEVELS,
+} from "../models/index.js";
+import { chat, parseJson } from "./openrouter.js";
+import { EXTRACT_V1, REVIEW_V1, WRITE_V1 } from "./prompts.js";
+import { htmlToText, safeFetch } from "./safe-fetch.js";
+import { deterministicChecks, lessonContentSchema } from "../services/content-schema.js";
+import { storeFile } from "../services/storage.js";
+
+/* ───────────── Paramètres des tâches ───────────── */
+
+export const generateParams = z.object({
+  nodeId: z.string().regex(/^[a-f\d]{24}$/i),
+  type: z.enum(RESOURCE_TYPES),
+  difficulty: z.enum(DIFFICULTIES).default("standard"),
+  illustrationLevel: z.enum(ILLUSTRATION_LEVELS).default("simple"),
+  sourceIds: z.array(z.string().regex(/^[a-f\d]{24}$/i)).max(5).default([]),
+  /** Si vrai, une ressource existante avec la même clé est régénérée (demande explicite d'un relecteur). */
+  force: z.boolean().default(false),
+});
+
+export const buildLibraryParams = z.object({
+  classLevel: z.string(),
+  subjectCode: z.string(),
+  types: z.array(z.enum(RESOURCE_TYPES)).min(1).max(6).default(["lesson_plan", "exercises", "assessment"]),
+  difficulties: z.array(z.enum(DIFFICULTIES)).min(1).max(3).default(["standard"]),
+  term: z.number().int().min(1).max(3).optional(),
+  perJobBudgetUsd: z.number().min(0.05).max(10).default(0.5),
+});
+
+export const extractParams = z.object({
+  sourceId: z.string().regex(/^[a-f\d]{24}$/i),
+  classLevel: z.string(),
+  subjectCode: z.string(),
+  subsystem: z.enum(["francophone", "anglophone"]),
+  curriculumVersion: z.string().min(2).max(40),
+});
+
+export const STEPS: Record<AiJobKind, string[]> = {
+  generate_resource: ["check_cache", "load_context", "write", "deterministic_checks", "ai_review", "save_for_human_review"],
+  review_resource: ["load_resource", "ai_review"],
+  extract_source: ["fetch", "extract", "save_nodes"],
+  build_library: ["list_nodes", "enqueue_generations"],
+};
+
+export function generationKey(p: {
+  subsystem: string;
+  classLevel: string;
+  subjectCode: string;
+  nodeId: string;
+  type: string;
+  difficulty: string;
+  illustrationLevel: string;
+  curriculumVersion: string;
+}) {
+  const raw = [...Object.values(p), WRITE_V1.version, "schema.v1"].join("|");
+  return crypto.createHash("sha256").update(raw).digest("hex");
+}
+
+type JobDoc = InstanceType<typeof AiJob>;
+type StepCtx = { job: JobDoc; outputs: Record<string, any> };
+type StepResult = { output?: unknown; skipRest?: boolean; finalStatus?: "done" | "waiting_review" };
+
+/** Sources : uniquement des extraits du texte extrait, balisés comme données. */
+async function sourceExcerpts(sourceIds: string[], maxChars = 12_000) {
+  if (!sourceIds.length) return { text: "", refs: [] as { ref: string; id: string }[] };
+  const docs = await SourceDocument.find({ _id: { $in: sourceIds }, status: { $in: ["extracted", "verified"] } })
+    .select("+extractedText title issuer")
+    .lean();
+  const per = Math.floor(maxChars / Math.max(1, docs.length));
+  const refs = docs.map((d, i) => ({ ref: `S${i + 1}`, id: String(d._id) }));
+  const text = docs
+    .map((d, i) => `<document ref="S${i + 1}" title="${d.title.replace(/"/g, "'")}" issuer="${d.issuer}">\n${(d.extractedText ?? "").slice(0, per)}\n</document>`)
+    .join("\n");
+  return { text, refs };
+}
+
+/* ───────────── Étapes ───────────── */
+
+const handlers: Record<string, (ctx: StepCtx) => Promise<StepResult>> = {
+  /* generate_resource */
+  async check_cache({ job }) {
+    const p = generateParams.parse(job.params);
+    const node = await CurriculumNode.findById(p.nodeId).lean();
+    if (!node) throw new Error("Nœud du référentiel introuvable");
+    const key = generationKey({
+      subsystem: node.subsystem,
+      classLevel: node.classLevel,
+      subjectCode: node.subjectCode,
+      nodeId: p.nodeId,
+      type: p.type,
+      difficulty: p.difficulty,
+      illustrationLevel: p.illustrationLevel,
+      curriculumVersion: node.curriculumVersion,
+    });
+    const existing = await Resource.findOne({ generationKey: key, status: { $nin: ["REJECTED", "ARCHIVED"] } }).select("_id").lean();
+    if (existing && !p.force) {
+      // Aucune dépense : la ressource existe déjà dans la bibliothèque.
+      job.resultResourceIds = [existing._id];
+      return { output: { cached: true, resourceId: String(existing._id) }, skipRest: true, finalStatus: "done" };
+    }
+    return { output: { key } };
+  },
+
+  async load_context({ job }) {
+    const p = generateParams.parse(job.params);
+    const node = await CurriculumNode.findById(p.nodeId).lean();
+    if (!node) throw new Error("Nœud introuvable");
+    const subject = await Subject.findOne({ subsystem: node.subsystem, code: node.subjectCode }).lean();
+    const sourceIds = p.sourceIds.length ? p.sourceIds : (node.sourceRefs ?? []).map((s) => String(s.sourceId));
+    const excerpts = await sourceExcerpts(sourceIds);
+    return {
+      output: {
+        subsystem: node.subsystem,
+        classLevel: node.classLevel,
+        subjectCode: node.subjectCode,
+        subjectName: subject?.name ?? node.subjectCode,
+        lessonTitle: node.title,
+        objectives: node.objectives,
+        durationMin: node.durationMin,
+        curriculumVersion: node.curriculumVersion,
+        excerpts: excerpts.text,
+        sourceRefs: excerpts.refs,
+      },
+    };
+  },
+
+  async write({ job, outputs }) {
+    const p = generateParams.parse(job.params);
+    const c = outputs.load_context;
+    const { text } = await chat({
+      jobId: String(job._id),
+      step: "write",
+      model: env.aiModelWrite,
+      promptVersion: WRITE_V1.version,
+      json: true,
+      messages: [
+        { role: "system", content: WRITE_V1.system },
+        {
+          role: "user",
+          content: WRITE_V1.user({
+            type: p.type,
+            subsystem: c.subsystem,
+            classLevel: c.classLevel,
+            subjectName: c.subjectName,
+            lessonTitle: c.lessonTitle,
+            objectives: c.objectives,
+            durationMin: c.durationMin,
+            difficulty: p.difficulty,
+            illustrationLevel: p.illustrationLevel,
+            language: c.subsystem === "anglophone" ? "en" : "fr",
+            sourceExcerpts: c.excerpts,
+          }),
+        },
+      ],
+    });
+    const parsed = parseJson<{ title: string; summary?: string; content: unknown; usedSourcePages?: { sourceRef: string; pages: number[] }[] }>(text);
+    const content = lessonContentSchema.parse(parsed.content);
+    return { output: { title: String(parsed.title || c.lessonTitle).slice(0, 240), summary: parsed.summary?.slice(0, 600), content, usedSourcePages: parsed.usedSourcePages ?? [] } };
+  },
+
+  async deterministic_checks({ outputs }) {
+    const w = outputs.write;
+    const issues = deterministicChecks(w.content, outputs.load_context.durationMin);
+    return { output: { issues } };
+  },
+
+  async ai_review({ job, outputs }) {
+    let classLevel: string, subsystem: string, objectives: string[], resourceJson: string;
+    if (job.kind === "review_resource") {
+      const r = outputs.load_resource;
+      ({ classLevel, subsystem, objectives } = r);
+      resourceJson = JSON.stringify(r.content);
+    } else {
+      const c = outputs.load_context;
+      ({ classLevel, subsystem, objectives } = c);
+      resourceJson = JSON.stringify(outputs.write.content);
+    }
+    const { text } = await chat({
+      jobId: String(job._id),
+      step: "ai_review",
+      // Modèle différent du rédacteur pour une relecture indépendante.
+      model: env.aiModelReview,
+      promptVersion: REVIEW_V1.version,
+      json: true,
+      temperature: 0,
+      messages: [
+        { role: "system", content: REVIEW_V1.system },
+        { role: "user", content: REVIEW_V1.user({ classLevel, subsystem, objectives, resourceJson: resourceJson.slice(0, 40_000), sourceExcerpts: (outputs.load_context?.excerpts ?? "").slice(0, 6000) }) },
+      ],
+    });
+    const review = z
+      .object({ score: z.number().min(0).max(100), issues: z.array(z.object({ severity: z.string(), area: z.string(), message: z.string() })).max(60) })
+      .parse(parseJson(text));
+    if (job.kind === "review_resource") {
+      await Resource.updateOne(
+        { _id: outputs.load_resource.id },
+        { aiReview: { ...review, model: env.aiModelReview, checkedAt: new Date() } }
+      );
+      return { output: review, finalStatus: "done" };
+    }
+    return { output: review };
+  },
+
+  async save_for_human_review({ job, outputs }) {
+    const p = generateParams.parse(job.params);
+    const c = outputs.load_context;
+    const w = outputs.write;
+    const refs: { ref: string; id: string }[] = c.sourceRefs ?? [];
+    const sources = refs.map((r) => ({
+      sourceId: r.id,
+      pages: (w.usedSourcePages as { sourceRef: string; pages: number[] }[]).find((u) => u.sourceRef === r.ref)?.pages ?? [],
+    }));
+    const issues = [...outputs.deterministic_checks.issues, ...outputs.ai_review.issues];
+    const resource = await Resource.create({
+      type: p.type,
+      subsystem: c.subsystem,
+      classLevel: c.classLevel,
+      subjectCode: c.subjectCode,
+      nodeId: p.nodeId,
+      title: w.title,
+      summary: w.summary,
+      difficulty: p.difficulty,
+      illustrationLevel: p.illustrationLevel,
+      durationMin: c.durationMin,
+      content: w.content,
+      sources,
+      curriculumVersion: c.curriculumVersion,
+      origin: "ai",
+      generationKey: outputs.check_cache.key,
+      aiJobId: job._id,
+      // Jamais publiée directement : passage obligatoire par la relecture humaine.
+      status: "HUMAN_REVIEW",
+      aiReview: { score: outputs.ai_review.score, issues, model: env.aiModelReview, checkedAt: new Date() },
+    });
+    job.resultResourceIds = [resource._id];
+    return { output: { resourceId: String(resource._id) }, finalStatus: "waiting_review" };
+  },
+
+  /* review_resource */
+  async load_resource({ job }) {
+    const r = await Resource.findById(job.params.resourceId).lean();
+    if (!r) throw new Error("Ressource introuvable");
+    const node = await CurriculumNode.findById(r.nodeId).select("objectives").lean();
+    return { output: { id: String(r._id), classLevel: r.classLevel, subsystem: r.subsystem, objectives: node?.objectives ?? [], content: r.content } };
+  },
+
+  /* extract_source */
+  async fetch({ job }) {
+    const p = extractParams.parse(job.params);
+    const src = await SourceDocument.findById(p.sourceId).select("+extractedText");
+    if (!src) throw new Error("Source introuvable");
+    if (src.extractedText) return { output: { alreadyExtracted: true, mime: "text/plain" } };
+    if (!src.url && !src.fileUrl) throw new Error("La source n'a ni URL ni fichier");
+    const fetched = await safeFetch((src.fileUrl ?? src.url)!);
+    src.sha256 = fetched.sha256;
+    src.status = "fetched";
+    if (fetched.mime.includes("html") || fetched.mime.startsWith("text/")) {
+      src.extractedText = htmlToText(fetched.data.toString("utf8")).slice(0, 400_000);
+      src.status = "extracted";
+      await src.save();
+      return { output: { mime: fetched.mime } };
+    }
+    if (!src.fileUrl) {
+      const stored = await storeFile(`source-${src._id}.pdf`, fetched.data, fetched.mime);
+      src.fileUrl = stored.url;
+      src.fileKey = stored.key;
+    }
+    await src.save();
+    return { output: { mime: fetched.mime, base64: fetched.mime === "application/pdf" ? fetched.data.toString("base64") : undefined } };
+  },
+
+  async extract({ job, outputs }) {
+    const p = extractParams.parse(job.params);
+    const src = await SourceDocument.findById(p.sourceId).select("+extractedText").lean();
+    const content: Parameters<typeof chat>[0]["messages"][number]["content"] = outputs.fetch.base64
+      ? [
+          { type: "text", text: EXTRACT_V1.user(p) },
+          { type: "file", file: { filename: "source.pdf", file_data: `data:application/pdf;base64,${outputs.fetch.base64}` } },
+        ]
+      : `${EXTRACT_V1.user(p)}\n<document>${(src?.extractedText ?? "").slice(0, 120_000)}</document>`;
+    const { text } = await chat({
+      jobId: String(job._id),
+      step: "extract",
+      model: env.aiModelExtract,
+      promptVersion: EXTRACT_V1.version,
+      json: true,
+      temperature: 0,
+      maxTokens: 12_000,
+      messages: [
+        { role: "system", content: EXTRACT_V1.system },
+        { role: "user", content },
+      ],
+    });
+    const parsed = z
+      .object({
+        nodes: z
+          .array(
+            z.object({
+              kind: z.enum(["domain", "unit", "competency", "lesson"]),
+              ref: z.string(),
+              parentRef: z.string().nullable().optional(),
+              title: z.string().min(2).max(240),
+              objectives: z.array(z.string().max(400)).max(15).default([]),
+              durationMin: z.number().int().min(5).max(240).default(45),
+              term: z.number().int().min(1).max(3).optional(),
+              order: z.number().int().min(0).default(0),
+              pages: z.array(z.number().int().min(1)).max(30).default([]),
+            })
+          )
+          .max(600),
+      })
+      .parse(parseJson(text));
+    return { output: parsed };
+  },
+
+  async save_nodes({ job, outputs }) {
+    const p = extractParams.parse(job.params);
+    const idByRef = new Map<string, unknown>();
+    let created = 0;
+    // Les nœuds extraits restent au statut « extracted » jusqu'à validation humaine dans l'admin.
+    for (const n of outputs.extract.nodes as any[]) {
+      const doc = await CurriculumNode.create({
+        subsystem: p.subsystem,
+        classLevel: p.classLevel,
+        subjectCode: p.subjectCode,
+        kind: n.kind,
+        parentId: n.parentRef ? idByRef.get(n.parentRef) : undefined,
+        title: n.title,
+        objectives: n.objectives,
+        durationMin: n.durationMin,
+        term: n.term,
+        order: n.order,
+        sourceRefs: [{ sourceId: p.sourceId, pages: n.pages }],
+        curriculumVersion: p.curriculumVersion,
+        status: "extracted",
+      });
+      idByRef.set(n.ref, doc._id);
+      created++;
+    }
+    await SourceDocument.updateOne({ _id: p.sourceId }, { status: "extracted" });
+    return { output: { created }, finalStatus: "waiting_review" };
+  },
+
+  /* build_library */
+  async list_nodes({ job }) {
+    const p = buildLibraryParams.parse(job.params);
+    const filter: Record<string, unknown> = { classLevel: p.classLevel, subjectCode: p.subjectCode, kind: "lesson", status: "validated" };
+    if (p.term) filter.term = p.term;
+    const ids = await CurriculumNode.find(filter).sort({ order: 1 }).distinct("_id");
+    return { output: { nodeIds: ids.map(String) } };
+  },
+
+  async enqueue_generations({ job, outputs }) {
+    const p = buildLibraryParams.parse(job.params);
+    const docs = [];
+    for (const nodeId of outputs.list_nodes.nodeIds as string[])
+      for (const type of p.types)
+        for (const difficulty of p.difficulties)
+          docs.push({
+            kind: "generate_resource",
+            params: { nodeId, type, difficulty, illustrationLevel: "simple", sourceIds: [], force: false },
+            steps: STEPS.generate_resource.map((name) => ({ name })),
+            budgetUsd: p.perJobBudgetUsd,
+            createdBy: job.createdBy,
+          });
+    // Chaque génération est une petite tâche reprenable ; check_cache évite les doublons.
+    if (docs.length) await AiJob.insertMany(docs);
+    return { output: { enqueued: docs.length }, finalStatus: "done" };
+  },
+};
+
+/** Exécute les étapes restantes d'une tâche, en reprenant à l'étape en cours. */
+export async function runJob(job: JobDoc) {
+  const outputs: Record<string, any> = {};
+  for (const s of job.steps) if (s.status === "done") outputs[s.name] = s.output;
+
+  for (let i = job.currentStep; i < job.steps.length; i++) {
+    const step = job.steps[i];
+    if (step.status === "done" || step.status === "skipped") continue;
+    const handler = handlers[step.name];
+    if (!handler) throw new Error(`Étape inconnue : ${step.name}`);
+    step.status = "running";
+    step.attempts += 1;
+    step.startedAt = new Date();
+    job.currentStep = i;
+    await job.save();
+
+    const result = await handler({ job, outputs });
+    step.status = "done";
+    step.output = result.output as any;
+    step.error = undefined;
+    step.finishedAt = new Date();
+    outputs[step.name] = result.output;
+    if (result.skipRest) for (let k = i + 1; k < job.steps.length; k++) job.steps[k].status = "skipped";
+    if (result.finalStatus) job.status = result.finalStatus;
+    job.currentStep = i + 1;
+    await job.save();
+    if (result.skipRest) break;
+  }
+  if (job.status === "running") job.status = "done";
+  await job.save();
+}
