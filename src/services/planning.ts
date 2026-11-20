@@ -32,6 +32,11 @@ export async function ensurePlan(teacherId: string, classLevel: string, schoolYe
     getCalendar(schoolYear),
   ]);
   if (!timetable || timetable.slots.length === 0) return 0;
+  // Un nouvel emploi du temps ne crée pas de séances dans le passé : la progression commence le jour où il est créé
+  // (sinon un enseignant inscrit aujourd'hui aurait déjà une semaine de « retard » fictif).
+  const createdOn = timetable.createdAt ? new Date(timetable.createdAt).toISOString().slice(0, 10) : from;
+  if (createdOn > from) from = createdOn;
+  if (from > to) return 0;
   // Déjà planifié sur cette plage : aucun calcul (cas le plus fréquent, à chaque ouverture de l'app).
   if (timetable.plannedFrom && timetable.plannedThrough && timetable.plannedFrom <= from && to <= timetable.plannedThrough) return 0;
 

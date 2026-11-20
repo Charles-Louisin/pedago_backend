@@ -475,3 +475,36 @@ teacherRouter.get(
     );
   })
 );
+
+/** Grille de progression : chaque leçon de l'année et son état (pour l'affichage en tuiles). */
+teacherRouter.get(
+  "/progress/grid",
+  validate(z.object({ classLevel: z.enum(ALL_CLASS_LEVELS) }), "query"),
+  ah(async (req, res) => {
+    const classLevel = String(req.query.classLevel);
+    const profile = await profileOf(uid(req));
+    assertTeaches(profile, classLevel);
+    const subjects = profile.assignments.find((a) => a.classLevel === classLevel)?.subjects ?? [];
+    const [nodes, lessons] = await Promise.all([
+      CurriculumNode.find({ classLevel, subjectCode: { $in: subjects }, kind: "lesson", status: { $ne: "retired" } })
+        .sort({ order: 1 })
+        .select("_id subjectCode title order term")
+        .lean(),
+      LessonInstance.find({ teacherId: uid(req), classLevel }).select("nodeId status").lean(),
+    ]);
+    const rank: Record<string, number> = { done: 4, partial: 3, missed: 2, planned: 1 };
+    const best = new Map<string, string>();
+    for (const l of lessons) {
+      const k = String(l.nodeId);
+      if ((rank[l.status] ?? 0) > (rank[best.get(k) ?? ""] ?? 0)) best.set(k, l.status);
+    }
+    res.json(
+      subjects.map((subjectCode) => ({
+        subjectCode,
+        lessons: nodes
+          .filter((n) => n.subjectCode === subjectCode)
+          .map((n) => ({ id: String(n._id), title: n.title, order: n.order, term: n.term ?? null, status: best.get(String(n._id)) ?? "none" })),
+      }))
+    );
+  })
+);
