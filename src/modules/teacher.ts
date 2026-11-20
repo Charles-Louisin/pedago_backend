@@ -24,7 +24,8 @@ import { ah, badRequest, notFound } from "../utils/http-error.js";
 import { addDays, isLocalDate, minutesBetween } from "../utils/dates.js";
 import { applyCatchUp, ensurePlan, proposeCatchUp } from "../services/planning.js";
 import { lessonsFor, parseProgression, resetTeacherCurriculum, saveTeacherCurriculum } from "../services/curriculum.js";
-import { buildLessonDocument } from "../services/exports.js";
+import { buildLessonDocument, composeLessonDoc, previewOf, type ComposeOptions } from "../services/exports.js";
+import { prepLayoutSchema, type PrepLayout } from "../services/layout.js";
 import { toMe } from "./auth.js";
 
 export const teacherRouter = Router();
@@ -616,6 +617,8 @@ const prepContent = z.object({
   writtenTrace: z.string().max(4000).optional(),
   exercises: z.array(z.object({ prompt: z.string().min(1).max(2000), answer: z.string().max(2000).default("") })).max(30).optional(),
   notes: z.string().max(6000).optional(),
+  /** Rubriques propres à l'enseignant (« Domaine », « Prérequis »…), dans son vocabulaire. */
+  extra: z.array(z.object({ label: z.string().trim().min(1).max(120), lines: z.array(z.string().max(800)).max(40) })).max(12).optional(),
 });
 
 async function ownNode(teacherId: string, nodeId: string) {
@@ -663,27 +666,49 @@ teacherRouter.post(
 );
 
 teacherRouter.get(
+  "/preps/:nodeId/preview",
+  ah(async (req, res) => {
+    const node = await ownNode(uid(req), String(req.params.nodeId));
+    const [profile, user] = await Promise.all([profileOf(uid(req)), User.findById(uid(req)).lean()]);
+    const today = new Date().toISOString().slice(0, 10);
+    const { doc, usedPrep, usedLayout } = await composeLessonDoc({
+      teacherId: uid(req),
+      teacherName: user?.fullName ?? "",
+      schoolName: profile.schoolName ?? "",
+      lesson: { _id: node._id, nodeId: node._id, classLevel: node.classLevel, subjectCode: node.subjectCode, date: today, start: null, end: null },
+      difficulty: "standard",
+      illustrationLevel: profile.preferences?.illustrationLevel ?? "simple",
+      includeAnswers: true,
+      defaultLayout: (profile.prepLayout as PrepLayout | null) ?? null,
+    });
+    res.json({ ...previewOf(doc), usedPrep, usedLayout, adaptation: "not_needed", difficulty: "standard" });
+  })
+);
+
+teacherRouter.get(
   "/preps/:nodeId",
   ah(async (req, res) => {
     await ownNode(uid(req), String(req.params.nodeId));
     const prep = await TeacherPrep.findOne({ teacherId: uid(req), nodeId: req.params.nodeId }).lean();
-    res.json(prep ? { content: prep.content, fileName: prep.fileName ?? null, fileUrl: prep.fileUrl ?? null, updatedAt: prep.updatedAt } : null);
+    res.json(prep ? { content: prep.content, layout: prep.layout ?? null, fileName: prep.fileName ?? null, fileUrl: prep.fileUrl ?? null, updatedAt: prep.updatedAt } : null);
   })
 );
 
 teacherRouter.put(
   "/preps/:nodeId",
   // Le fichier d'origine se désigne par l'identifiant de son dépôt : seul un fichier de l'enseignant lui-même est accepté.
-  validate(z.object({ content: prepContent, uploadId: z.string().regex(/^[a-f\d]{24}$/i).optional() })),
+  validate(z.object({ content: prepContent, uploadId: z.string().regex(/^[a-f\d]{24}$/i).optional(), layout: prepLayoutSchema.nullish() })),
   ah(async (req, res) => {
     await ownNode(uid(req), String(req.params.nodeId));
     const upload = req.body.uploadId ? await TeacherUpload.findOne({ _id: req.body.uploadId, teacherId: uid(req), kind: "prep" }).lean() : null;
     if (req.body.uploadId && !upload) throw notFound("Fichier introuvable");
     const prep = await TeacherPrep.findOneAndUpdate(
       { teacherId: uid(req), nodeId: req.params.nodeId },
-      { content: req.body.content, ...(upload ? { fileUrl: upload.url, fileName: upload.name ?? "fiche", fileMime: upload.mime } : {}) },
+      { content: req.body.content, ...(req.body.layout !== undefined ? { layout: req.body.layout } : {}), ...(upload ? { fileUrl: upload.url, fileName: upload.name ?? "fiche", fileMime: upload.mime } : {}) },
       { upsert: true, new: true }
     ).lean();
+    // Le modèle de la dernière fiche importée devient celui de toutes les fiches de l'enseignant.
+    if (req.body.layout) await TeacherProfile.updateOne({ userId: uid(req) }, { prepLayout: req.body.layout });
     res.json({ content: prep.content, fileName: prep.fileName ?? null, updatedAt: prep.updatedAt });
   })
 );
@@ -700,30 +725,43 @@ teacherRouter.delete(
  * Document de la séance : la fiche de l'enseignant d'abord, complétée par la bibliothèque
  * (variante la plus proche du niveau et des illustrations choisis), avec l'en-tête de la classe.
  */
+const documentOptions = z.object({
+  difficulty: z.enum(["easy", "standard", "advanced"]).optional(),
+  illustrationLevel: z.enum(["simple", "standard", "detailed"]).optional(),
+  includeAnswers: z.boolean().default(true),
+});
+
+/** Options de composition d'une séance (aperçu et PDF identiques) : modèle de l'enseignant compris. */
+async function composeOptions(req: AuthedRequest, body: z.infer<typeof documentOptions>): Promise<ComposeOptions> {
+  const lesson = await LessonInstance.findOne({ _id: req.params.lessonId, teacherId: uid(req) }).lean();
+  if (!lesson) throw notFound("Séance introuvable");
+  const [profile, user] = await Promise.all([profileOf(uid(req)), User.findById(uid(req)).lean()]);
+  return {
+    teacherId: uid(req),
+    teacherName: user?.fullName ?? "",
+    schoolName: profile.schoolName ?? "",
+    lesson,
+    difficulty: body.difficulty ?? profile.preferences?.difficulty ?? "standard",
+    illustrationLevel: body.illustrationLevel ?? profile.preferences?.illustrationLevel ?? "simple",
+    includeAnswers: body.includeAnswers,
+    defaultLayout: (profile.prepLayout as PrepLayout | null) ?? null,
+  };
+}
+
+/** Aperçu fidèle : les blocs exacts que le PDF dessinera, au niveau demandé (adapté par l'IA si besoin). */
+teacherRouter.post(
+  "/lessons/:lessonId/preview",
+  validate(documentOptions),
+  ah(async (req, res) => {
+    const { doc, usedPrep, usedLibrary, usedLayout, adaptation } = await composeLessonDoc(await composeOptions(req as AuthedRequest, req.body));
+    res.json({ ...previewOf(doc), usedPrep, usedLibrary, usedLayout, adaptation, difficulty: doc.difficulty });
+  })
+);
+
 teacherRouter.post(
   "/lessons/:lessonId/document",
-  validate(
-    z.object({
-      format: z.enum(["pdf", "docx"]).default("pdf"),
-      difficulty: z.enum(["easy", "standard", "advanced"]).optional(),
-      illustrationLevel: z.enum(["simple", "standard", "detailed"]).optional(),
-      includeAnswers: z.boolean().default(true),
-    })
-  ),
+  validate(documentOptions.extend({ format: z.enum(["pdf", "docx"]).default("pdf") })),
   ah(async (req, res) => {
-    const lesson = await LessonInstance.findOne({ _id: req.params.lessonId, teacherId: uid(req) }).lean();
-    if (!lesson) throw notFound("Séance introuvable");
-    const [profile, user] = await Promise.all([profileOf(uid(req)), User.findById(uid(req)).lean()]);
-    const out = await buildLessonDocument({
-      teacherId: uid(req),
-      teacherName: user?.fullName ?? "",
-      schoolName: profile.schoolName ?? "",
-      lesson,
-      difficulty: req.body.difficulty ?? profile.preferences?.difficulty ?? "standard",
-      illustrationLevel: req.body.illustrationLevel ?? profile.preferences?.illustrationLevel ?? "simple",
-      includeAnswers: req.body.includeAnswers,
-      format: req.body.format,
-    });
-    res.json(out);
+    res.json(await buildLessonDocument({ ...(await composeOptions(req as AuthedRequest, req.body)), format: req.body.format }));
   })
 );

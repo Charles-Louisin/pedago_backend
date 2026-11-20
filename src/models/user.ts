@@ -68,6 +68,8 @@ const teacherProfileSchema = new Schema(
         subjects: [{ type: String }],
       },
     ],
+    /** Modèle de fiche de l'enseignant (relevé sur sa dernière fiche importée) : appliqué à toutes ses fiches. */
+    prepLayout: { type: Schema.Types.Mixed, default: null },
     preferences: {
       difficulty: { type: String, enum: ["easy", "standard", "advanced"], default: "standard" },
       illustrationLevel: { type: String, enum: ["simple", "standard", "detailed"], default: "simple" },

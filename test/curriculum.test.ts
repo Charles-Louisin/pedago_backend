@@ -198,6 +198,71 @@ test("import : progression et fiche en PDF lues sans IA, photo refusée tant que
   assert.equal((await upload("curriculum", Buffer.from("pas un pdf"), "faux.pdf", "application/pdf")).status, 415);
 });
 
+test("fiche au modèle de l'enseignant : mise en page relevée, aperçu et PDF identiques, niveau signalé", async () => {
+  const pdf = await pdfWith([
+    "FICHE DE PRÉPARATION",
+    "École : EP Bastos",
+    "Classe : CP",
+    "Effectif : 62",
+    "Date :",
+    "Objectif spécifique :",
+    "- Compter jusqu'à 30",
+    "Matériel didactique : bâtonnets, ardoises",
+    "Déroulement",
+    "Étapes   Durée   Activités du maître   Activités des élèves",
+    "Rappel (5 min) : calcul mental",
+    "Découverte (20 min) : manipulation des bâtonnets",
+    "Je retiens",
+    "On compte par dizaines.",
+  ]);
+  const imp = await upload("prep", pdf, "fiche-maison.pdf", "application/pdf");
+  assert.equal(imp.status, 200);
+  assert.equal(imp.body.layout.title, "FICHE DE PRÉPARATION");
+  assert.deepEqual(imp.body.layout.header.map((h: { label: string }) => h.label), ["École", "Classe", "Effectif", "Date"]);
+  assert.deepEqual(imp.body.layout.sections.map((x: { label: string }) => x.label), ["Objectif spécifique", "Matériel didactique", "Déroulement", "Je retiens"]);
+  assert.deepEqual(imp.body.layout.stepColumns.map((c: { label: string }) => c.label), ["Étapes", "Durée", "Activités du maître", "Activités des élèves"]);
+
+  const plan = await call("/teacher/planning?from=2026-11-23&to=2026-11-27");
+  const lesson = plan.body.lessons.find((l: { subjectCode: string }) => l.subjectCode === "MATH");
+  assert.equal((await call(`/teacher/preps/${lesson.node.id}`, { method: "PUT", body: { content: imp.body.data, layout: imp.body.layout, uploadId: imp.body.uploadId } })).status, 200);
+
+  // Aperçu : le modèle de l'enseignant (titre, cartouche, rubriques, colonnes), pas celui de PEDAGO.
+  const prev = await call(`/teacher/lessons/${lesson.id}/preview`, { method: "POST", body: { difficulty: "standard", includeAnswers: false } });
+  assert.equal(prev.status, 200);
+  assert.equal(prev.body.kicker, "FICHE DE PRÉPARATION");
+  assert.deepEqual(prev.body.meta.map((m: [string, string]) => m[0]), ["École", "Classe", "Effectif", "Date"]);
+  assert.equal(prev.body.meta[1][1], "CP");
+  const headings = prev.body.blocks.map((b: { heading: string }) => b.heading);
+  assert.deepEqual(headings, ["Objectif spécifique", "Matériel didactique", "Déroulement", "Je retiens"]);
+  assert.deepEqual(prev.body.blocks[2].table[0], ["Étapes", "Durée", "Activités du maître", "Activités des élèves"]);
+  assert.equal(prev.body.usedLayout, true);
+  assert.equal(prev.body.adaptation, "not_needed");
+
+  // Le PDF téléchargé contient exactement les mêmes intitulés, dans le même ordre.
+  const doc = await call(`/teacher/lessons/${lesson.id}/document`, { method: "POST", body: { format: "pdf", difficulty: "standard", includeAnswers: false } });
+  const { extractText, getDocumentProxy } = await import("unpdf");
+  const file = fs.readFileSync(`${localExportsDir}/${doc.body.url.split("/exports/")[1]}`);
+  const { text } = await extractText(await getDocumentProxy(new Uint8Array(file)), { mergePages: true });
+  // Le titre est espacé lettre à lettre dans le PDF : on compare sans les espaces.
+  const squash = (x: string) => x.toUpperCase().replace(/\s+/g, "");
+  const flat = squash(String(text));
+  let cursor = -1;
+  for (const h of ["FICHE DE PRÉPARATION", ...headings.map((h: string) => h.toUpperCase())]) {
+    const at = flat.indexOf(squash(h), cursor + 1);
+    assert.ok(at > cursor, `« ${h} » absent ou hors d'ordre dans le PDF`);
+    cursor = at;
+  }
+
+  // Le modèle devient celui des autres fiches de l'enseignant.
+  const other = plan.body.lessons.find((l: { subjectCode: string; node: { id: string } }) => l.subjectCode !== "MATH");
+  const prevOther = await call(`/teacher/lessons/${other.id}/preview`, { method: "POST", body: {} });
+  assert.equal(prevOther.body.kicker, "FICHE DE PRÉPARATION");
+
+  // Niveau facile demandé sans IA : rien n'est inventé, l'aperçu le dit.
+  const easy = await call(`/teacher/lessons/${lesson.id}/preview`, { method: "POST", body: { difficulty: "easy" } });
+  assert.equal(easy.body.adaptation, "unavailable");
+});
+
 test("mes données : export complet puis suppression définitive du compte (fichiers compris)", async () => {
   const exp = await call("/teacher/me/export");
   assert.equal(exp.status, 200);

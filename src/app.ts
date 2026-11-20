@@ -67,6 +67,8 @@ export function createApp() {
   app.use("/api/v1/auth/mfa/verify", limiter(15 * 60_000, 30));
   // Imports de fiches et de progressions (lecture par IA) : 30 par jour et par compte.
   app.use("/api/v1/teacher/imports", limiter(24 * 3_600_000, 30, (req) => `imp:${req.header("authorization")?.slice(-24) ?? req.ip}`));
+  // Aperçus de fiche (niveau adapté par IA si besoin, mis en cache) : 200 par jour et par compte.
+  app.use(/^\/api\/v1\/teacher\/lessons\/[^/]+\/preview$/, limiter(24 * 3_600_000, 200, (req) => `prev:${req.header("authorization")?.slice(-24) ?? req.ip}`));
   // Génération de PDF/Word : opération coûteuse, limitée par utilisateur authentifié.
   app.use(/^\/api\/v1\/library\/resources\/[^/]+\/export\//, limiter(10 * 60_000, 60, (req) => `exp:${req.header("authorization")?.slice(-24) ?? req.ip}`));
 
