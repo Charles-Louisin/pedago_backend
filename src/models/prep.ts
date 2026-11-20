@@ -14,3 +14,19 @@ const teacherPrepSchema = new Schema(
 );
 teacherPrepSchema.index({ teacherId: 1, nodeId: 1 }, { unique: true });
 export const TeacherPrep = mongoose.model("TeacherPrep", teacherPrepSchema);
+
+/**
+ * Documents personnels générés (fiche de l'enseignant + bibliothèque) : rattachés à leur auteur
+ * pour pouvoir les effacer avec son compte. Référence seulement, le fichier est dans le stockage.
+ */
+const generatedDocumentSchema = new Schema(
+  {
+    teacherId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    lessonId: { type: Schema.Types.ObjectId, ref: "LessonInstance" },
+    url: { type: String, required: true },
+    key: { type: String, required: true },
+    sizeBytes: Number,
+  },
+  { timestamps: true }
+);
+export const GeneratedDocument = mongoose.model("GeneratedDocument", generatedDocumentSchema);

@@ -1,5 +1,4 @@
 import { Router } from "express";
-import bcrypt from "bcryptjs";
 import crypto from "node:crypto";
 import { sendMail, verificationEmail } from "../services/mail.js";
 import { z } from "zod";
@@ -7,8 +6,11 @@ import { Session, User, TeacherProfile, AuditLog } from "../models/index.js";
 import { validate } from "../middleware/validate.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { ah, badRequest, conflict, unauthorized, HttpError } from "../utils/http-error.js";
-import { hashToken, newRefreshToken, signAccessToken, type Role } from "../utils/jwt.js";
+import { hashToken, newRefreshToken, signAccessToken, signMfaChallenge, verifyMfaChallenge, type Role } from "../utils/jwt.js";
+import { decryptSecret, encryptSecret, newRecoveryCodes, newTotpSecret, normalizeRecovery, otpauthUrl, verifyTotp } from "../utils/totp.js";
 import { env } from "../config/env.js";
+import { deleteAccount } from "../services/account.js";
+import { burnVerify, hashPassword, needsRehash, verifyPassword } from "../utils/password.js";
 
 export const authRouter = Router();
 
@@ -29,20 +31,20 @@ const registerSchema = z
 
 const loginSchema = z.object({ identifier, password: z.string().min(1).max(128), device: z.string().max(120).optional() });
 
-let DUMMY_HASH: string | undefined;
 const MAX_FAILED = 5;
 const LOCK_MS = 15 * 60 * 1000;
 
-async function issueSession(user: { _id: unknown; role: string; emailVerified?: boolean | null }, device?: string) {
+async function issueSession(user: { _id: unknown; role: string; emailVerified?: boolean | null }, device?: string, mfa = false) {
   const refreshToken = newRefreshToken();
   const session = await Session.create({
     userId: user._id,
     refreshHash: hashToken(refreshToken),
     device,
+    mfa,
     expiresAt: new Date(Date.now() + env.refreshTokenTtlDays * 86_400_000),
     lastUsedAt: new Date(),
   });
-  const accessToken = signAccessToken({ sub: String(user._id), role: user.role as Role, sid: String(session._id), ev: Boolean(user.emailVerified) });
+  const accessToken = signAccessToken({ sub: String(user._id), role: user.role as Role, sid: String(session._id), ev: Boolean(user.emailVerified), mfa });
   return { accessToken, refreshToken, expiresIn: env.accessTokenTtlSec };
 }
 
@@ -116,7 +118,7 @@ authRouter.post(
     await user.save();
     // Nouveau jeton d'accès portant la vérification, utilisable immédiatement.
     const r = req as AuthedRequest;
-    const accessToken = signAccessToken({ sub: r.userId, role: r.role, sid: r.sessionId, ev: true });
+    const accessToken = signAccessToken({ sub: r.userId, role: r.role, sid: r.sessionId, ev: true, mfa: r.mfa });
     res.json({ verified: true, accessToken, expiresIn: env.accessTokenTtlSec });
   })
 );
@@ -137,7 +139,7 @@ authRouter.post(
     const { fullName, email, phone, password, device } = req.body as z.infer<typeof registerSchema>;
     const exists = await User.exists({ $or: [email ? { email } : null, phone ? { phone } : null].filter(Boolean) as object[] });
     if (exists) throw conflict("ACCOUNT_EXISTS", "Un compte existe déjà avec cet identifiant");
-    const user = await User.create({ fullName, email, phone, passwordHash: await bcrypt.hash(password, 12), role: "teacher" });
+    const user = await User.create({ fullName, email, phone, passwordHash: await hashPassword(password), role: "teacher" });
     const code = await sendVerificationCode(String(user._id));
     const tokens = await issueSession(user, device);
     res.status(201).json({ ...tokens, user: toMe(user, null), ...(env.devEchoCodes && code ? { devCode: code } : {}) });
@@ -157,14 +159,13 @@ authRouter.post(
     const invalid = unauthorized("Identifiant ou mot de passe incorrect");
     if (!user || user.disabled) {
       // Temps de réponse constant même si le compte n'existe pas.
-      DUMMY_HASH ??= await bcrypt.hash("pedago-dummy-password", 12);
-      await bcrypt.compare(password, DUMMY_HASH);
+      await burnVerify(password);
       throw invalid;
     }
     if (user.lockedUntil && user.lockedUntil > new Date()) {
       throw new HttpError(429, "ACCOUNT_LOCKED", "Trop de tentatives. Réessaie dans quelques minutes.");
     }
-    const ok = await bcrypt.compare(password, user.passwordHash);
+    const ok = await verifyPassword(user.passwordHash, password);
     if (!ok) {
       user.failedLogins = (user.failedLogins ?? 0) + 1;
       if (user.failedLogins >= MAX_FAILED) {
@@ -177,9 +178,13 @@ authRouter.post(
     user.failedLogins = 0;
     user.lockedUntil = undefined;
     user.lastLoginAt = new Date();
+    // Migration transparente vers Argon2id (le mot de passe en clair n'est disponible qu'ici).
+    if (needsRehash(user.passwordHash)) user.passwordHash = await hashPassword(password);
     await user.save();
     if (user.role !== "teacher") {
       await AuditLog.create({ actorId: user._id, action: "staff.login", ip: req.ip });
+      // Mot de passe correct : il reste le code de l'application d'authentification.
+      if (user.mfaEnabled) return res.json({ mfaRequired: true, mfaToken: signMfaChallenge(String(user._id)) });
     }
     const profile = await TeacherProfile.findOne({ userId: user._id }).lean();
     const tokens = await issueSession(user, device);
@@ -212,7 +217,7 @@ authRouter.post(
     }
     const user = await User.findById(session.userId).lean();
     if (!user || user.disabled) throw unauthorized("Session expirée");
-    const accessToken = signAccessToken({ sub: String(user._id), role: user.role as Role, sid: String(session._id), ev: Boolean(user.emailVerified) });
+    const accessToken = signAccessToken({ sub: String(user._id), role: user.role as Role, sid: String(session._id), ev: Boolean(user.emailVerified), mfa: Boolean(session.mfa) });
     res.json({ accessToken, refreshToken, expiresIn: env.accessTokenTtlSec });
   })
 );
@@ -243,6 +248,127 @@ authRouter.delete(
     const r = req as AuthedRequest;
     const out = await Session.updateOne({ _id: req.params.id, userId: r.userId }, { revokedAt: new Date() });
     if (!out.matchedCount) throw badRequest("NOT_FOUND", "Session introuvable");
+    res.status(204).end();
+  })
+);
+
+/* ───────────── Double authentification (TOTP) ───────────── */
+
+const MFA_MAX_FAILED = 5;
+
+/** Étape 2 de la connexion : code à 6 chiffres, ou un code de secours à usage unique. */
+authRouter.post(
+  "/mfa/verify",
+  validate(
+    z.object({
+      mfaToken: z.string().min(20).max(800),
+      code: z.string().trim().max(12).optional(),
+      recoveryCode: z.string().trim().max(20).optional(),
+      device: z.string().max(120).optional(),
+    })
+  ),
+  ah(async (req, res) => {
+    let userId: string;
+    try {
+      userId = verifyMfaChallenge(req.body.mfaToken);
+    } catch {
+      throw unauthorized("Étape expirée : reconnecte-toi");
+    }
+    const user = await User.findById(userId).select("+mfaSecretEnc +mfaLastStep +mfaRecoveryHashes +mfaFailed +lockedUntil");
+    if (!user || user.disabled || !user.mfaEnabled || !user.mfaSecretEnc) throw unauthorized("Étape expirée : reconnecte-toi");
+    if (user.lockedUntil && user.lockedUntil > new Date()) throw new HttpError(429, "ACCOUNT_LOCKED", "Trop de tentatives. Réessaie dans quelques minutes.");
+
+    let ok = false;
+    let usedRecovery = false;
+    if (req.body.code) {
+      const step = verifyTotp(decryptSecret(user.mfaSecretEnc), req.body.code, user.mfaLastStep ?? -1);
+      if (step !== null) {
+        ok = true;
+        user.mfaLastStep = step; // un même code ne sert qu'une fois
+      }
+    } else if (req.body.recoveryCode) {
+      const h = hashToken(normalizeRecovery(req.body.recoveryCode) + userId);
+      const left = (user.mfaRecoveryHashes ?? []).filter((x) => x !== h);
+      if (left.length < (user.mfaRecoveryHashes ?? []).length) {
+        ok = true;
+        usedRecovery = true;
+        user.mfaRecoveryHashes = left;
+      }
+    }
+    if (!ok) {
+      user.mfaFailed = (user.mfaFailed ?? 0) + 1;
+      if (user.mfaFailed >= MFA_MAX_FAILED) {
+        user.lockedUntil = new Date(Date.now() + LOCK_MS);
+        user.mfaFailed = 0;
+      }
+      await user.save();
+      throw unauthorized("Code incorrect");
+    }
+    user.mfaFailed = 0;
+    await user.save();
+    await AuditLog.create({ actorId: user._id, action: usedRecovery ? "staff.mfa_recovery_used" : "staff.mfa_ok", ip: req.ip });
+    const profile = await TeacherProfile.findOne({ userId: user._id }).lean();
+    const tokens = await issueSession(user, req.body.device, true);
+    res.json({ ...tokens, user: toMe(user, profile), ...(usedRecovery ? { recoveryCodesLeft: user.mfaRecoveryHashes?.length ?? 0 } : {}) });
+  })
+);
+
+/** Activation, étape 1 : un secret provisoire (QR code / clé à saisir dans l'application d'authentification). */
+authRouter.post(
+  "/mfa/setup",
+  requireAuth,
+  ah(async (req, res) => {
+    const r = req as AuthedRequest;
+    const user = await User.findById(r.userId);
+    if (!user) throw unauthorized();
+    if (user.mfaEnabled) throw conflict("MFA_ALREADY_ENABLED", "La double authentification est déjà active");
+    const secret = newTotpSecret();
+    user.mfaPendingEnc = encryptSecret(secret);
+    await user.save();
+    res.json({ secret, otpauthUrl: otpauthUrl(secret, user.email ?? user.fullName) });
+  })
+);
+
+/** Activation, étape 2 : le premier code prouve que l'application est bien configurée. */
+authRouter.post(
+  "/mfa/enable",
+  requireAuth,
+  validate(z.object({ code: z.string().trim().regex(/^\d{6}$/,"Code à 6 chiffres attendu") })),
+  ah(async (req, res) => {
+    const r = req as AuthedRequest;
+    const user = await User.findById(r.userId).select("+mfaPendingEnc");
+    if (!user?.mfaPendingEnc) throw badRequest("MFA_NOT_STARTED", "Recommence l'activation");
+    const secret = decryptSecret(user.mfaPendingEnc);
+    const step = verifyTotp(secret, req.body.code);
+    if (step === null) throw badRequest("CODE_INVALID", "Code incorrect : vérifie l'heure du téléphone");
+    const recoveryCodes = newRecoveryCodes();
+    user.mfaEnabled = true;
+    user.mfaSecretEnc = encryptSecret(secret);
+    user.mfaPendingEnc = undefined;
+    user.mfaLastStep = step;
+    user.mfaRecoveryHashes = recoveryCodes.map((c) => hashToken(normalizeRecovery(c) + r.userId));
+    await user.save();
+    // Les autres sessions, ouvertes sans le second facteur, sont fermées.
+    await Session.updateMany({ userId: r.userId, _id: { $ne: r.sessionId }, revokedAt: null }, { revokedAt: new Date() });
+    await Session.updateOne({ _id: r.sessionId }, { mfa: true });
+    await AuditLog.create({ actorId: user._id, action: "staff.mfa_enabled", ip: req.ip });
+    const accessToken = signAccessToken({ sub: r.userId, role: r.role, sid: r.sessionId, ev: Boolean(user.emailVerified), mfa: true });
+    res.json({ enabled: true, recoveryCodes, accessToken, expiresIn: env.accessTokenTtlSec });
+  })
+);
+
+/** Suppression définitive de son compte (enseignant), confirmée par le mot de passe. */
+authRouter.delete(
+  "/me",
+  requireAuth,
+  validate(z.object({ password: z.string().min(1).max(128) })),
+  ah(async (req, res) => {
+    const r = req as AuthedRequest;
+    if (r.role !== "teacher") throw new HttpError(403, "STAFF_ACCOUNT", "Un compte de l'équipe est supprimé par un administrateur");
+    const user = await User.findById(r.userId).select("+passwordHash");
+    if (!user) throw unauthorized();
+    if (!(await verifyPassword(user.passwordHash, req.body.password))) throw badRequest("WRONG_PASSWORD", "Mot de passe incorrect");
+    await deleteAccount(r.userId, req.ip);
     res.status(204).end();
   })
 );

@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
+import { exportAccount } from "../services/account.js";
 import {
   ALL_CLASS_LEVELS,
   CatchUpItem,
@@ -42,6 +43,17 @@ function assertTeaches(profile: { assignments: { classLevel: string }[] }, class
 }
 
 /* ───────────── Profil ───────────── */
+
+/** Export complet de mes données (droit d'accès et de portabilité). */
+teacherRouter.get(
+  "/me/export",
+  ah(async (req, res) => {
+    const data = await exportAccount(uid(req));
+    res.setHeader("Content-Disposition", `attachment; filename="pedago-mes-donnees-${new Date().toISOString().slice(0, 10)}.json"`);
+    res.setHeader("Cache-Control", "no-store");
+    res.json(data);
+  })
+);
 
 teacherRouter.get(
   "/me",
@@ -162,11 +174,16 @@ teacherRouter.put(
 /* ───────────── Programme du jour / plage ───────────── */
 
 async function resourcesFor(nodeIds: unknown[], prefs: { difficulty?: string; illustrationLevel?: string }) {
-  const own = await CurriculumNode.find({ _id: { $in: nodeIds }, matchedNodeId: { $ne: null } }).select("_id matchedNodeId").lean();
+  const fields = "_id nodeId type title difficulty illustrationLevel contentVersion assets.pdf.sizeBytes assets.docx.sizeBytes";
+  // En parallèle : ressources des leçons elles-mêmes, et leçons personnelles rattachées au programme officiel.
+  const [own, direct] = await Promise.all([
+    CurriculumNode.find({ _id: { $in: nodeIds }, matchedNodeId: { $ne: null } }).select("_id matchedNodeId").lean(),
+    Resource.find({ nodeId: { $in: nodeIds }, status: "PUBLISHED" }).select(fields).lean(),
+  ]);
   const alias = new Map(own.map((n) => [String(n.matchedNodeId), String(n._id)]));
-  const resources = await Resource.find({ nodeId: { $in: [...nodeIds, ...own.map((n) => n.matchedNodeId)] }, status: "PUBLISHED" })
-    .select("_id nodeId type title difficulty illustrationLevel contentVersion assets.pdf.sizeBytes assets.docx.sizeBytes")
-    .lean();
+  // Seulement si l'enseignant a sa propre progression : ressources des leçons officielles correspondantes.
+  const matched = own.length ? await Resource.find({ nodeId: { $in: own.map((n) => n.matchedNodeId) }, status: "PUBLISHED" }).select(fields).lean() : [];
+  const resources = [...direct, ...matched];
   const byNode = new Map<string, typeof resources>();
   for (const r of resources) {
     const key = alias.get(String(r.nodeId)) ?? String(r.nodeId);

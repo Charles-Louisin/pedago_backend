@@ -1,4 +1,4 @@
-import bcrypt from "bcryptjs";
+import { hashPassword } from "../utils/password.js";
 import { AcademicCalendar, CurriculumNode, Resource, Subject, TeacherProfile, Timetable, User } from "../models/index.js";
 import { logger } from "../utils/logger.js";
 
@@ -243,7 +243,7 @@ export async function seedDatabase() {
       await User.updateOne({ email: a.email }, { emailVerified: true });
       continue;
     }
-    const user = await User.create({ email: a.email, fullName: a.fullName, role: a.role, emailVerified: true, passwordHash: await bcrypt.hash(a.password, 12) });
+    const user = await User.create({ email: a.email, fullName: a.fullName, role: a.role, emailVerified: true, passwordHash: await hashPassword(a.password) });
     if (a.role === "teacher") {
       await TeacherProfile.create({
         userId: user._id,

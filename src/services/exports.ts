@@ -1,7 +1,7 @@
 import PDFDocument from "pdfkit";
 import { AlignmentType, Document, HeadingLevel, Packer, Paragraph, Table, TableCell, TableRow, TextRun, WidthType } from "docx";
 import crypto from "node:crypto";
-import { CurriculumNode, Resource, SourceDocument, TeacherPrep, CLASS_LABELS, type ClassLevel } from "../models/index.js";
+import { CurriculumNode, GeneratedDocument, Resource, SourceDocument, TeacherPrep, CLASS_LABELS, type ClassLevel } from "../models/index.js";
 import { lessonContentSchema, type LessonContent } from "./content-schema.js";
 import { storeFile } from "./storage.js";
 
@@ -331,5 +331,6 @@ export async function buildLessonDocument(o: {
     data,
     o.format === "pdf" ? "application/pdf" : "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
   );
+  await GeneratedDocument.create({ teacherId: o.teacherId, lessonId: o.lesson._id, url: stored.url, key: stored.key, sizeBytes: stored.sizeBytes });
   return { url: stored.url, sizeBytes: stored.sizeBytes, usedPrep: Boolean(prep), usedLibrary: Boolean(plan || exo || evalRes) };
 }

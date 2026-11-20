@@ -26,6 +26,8 @@ export const env = {
   jwtSecret: str("JWT_SECRET", "change-me-pedago-jwt-secret"),
   accessTokenTtlSec: num("ACCESS_TOKEN_TTL_SEC", 15 * 60),
   refreshTokenTtlDays: num("REFRESH_TOKEN_TTL_DAYS", 30),
+  /** Double authentification obligatoire pour l'équipe (toujours active en production). */
+  staffMfaRequired: isProduction || bool("STAFF_MFA_REQUIRED", true),
   corsOrigin: str("CORS_ORIGIN", "http://localhost:3100"),
   publicApiUrl: str("PUBLIC_API_URL").replace(/\/$/, ""),
   rateLimitMax: num("RATE_LIMIT_MAX", isProduction ? 400 : 3000),

@@ -28,3 +28,13 @@ export async function storeFile(name: string, data: Buffer, mime: string): Promi
 }
 
 export const localExportsDir = LOCAL_DIR;
+
+/** Efface un fichier stocké (UploadThing ou dossier local). Sans erreur si le fichier n'existe plus. */
+export async function deleteStoredFile(key: string, url: string) {
+  if (url.includes("/exports/")) {
+    const local = path.join(LOCAL_DIR, path.basename(key));
+    await fs.unlink(local).catch(() => undefined);
+    return;
+  }
+  if (utapi) await utapi.deleteFiles(key).catch(() => undefined);
+}

@@ -505,7 +505,7 @@ adminRouter.get(
     const { page, limit, role } = req.query as any;
     const filter = role ? { role } : {};
     const [items, total] = await Promise.all([
-      User.find(filter).select("fullName email phone role disabled lastLoginAt createdAt").sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+      User.find(filter).select("fullName email phone role disabled mfaEnabled lastLoginAt createdAt").sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
       User.countDocuments(filter),
     ]);
     res.json({ items, total });
@@ -515,13 +515,16 @@ adminRouter.get(
 adminRouter.patch(
   "/users/:id",
   requireRole("admin"),
-  validate(z.object({ role: z.enum(["teacher", "reviewer", "admin"]).optional(), disabled: z.boolean().optional() })),
+  validate(z.object({ role: z.enum(["teacher", "reviewer", "admin"]).optional(), disabled: z.boolean().optional(), resetMfa: z.literal(true).optional() })),
   ah(async (req, res) => {
     if (req.params.id === me(req).userId) throw badRequest("SELF_EDIT", "Tu ne peux pas modifier ton propre rôle");
-    const u = await User.findByIdAndUpdate(req.params.id, req.body, { new: true }).select("fullName email role disabled").lean();
+    const { resetMfa, ...patch } = req.body as { role?: string; disabled?: boolean; resetMfa?: true };
+    // Téléphone perdu : la personne réactivera la double authentification à sa prochaine connexion.
+    const mfaReset = resetMfa ? { mfaEnabled: false, $unset: { mfaSecretEnc: 1, mfaPendingEnc: 1, mfaRecoveryHashes: 1, mfaLastStep: 1 } } : {};
+    const u = await User.findByIdAndUpdate(req.params.id, { ...patch, ...mfaReset }, { new: true }).select("fullName email role disabled mfaEnabled").lean();
     if (!u) throw notFound();
-    // Compte désactivé ou rôle modifié : toutes ses sessions sont fermées immédiatement.
-    if (req.body.disabled === true || req.body.role) {
+    // Compte désactivé, rôle modifié ou 2FA réinitialisée : toutes ses sessions sont fermées immédiatement.
+    if (req.body.disabled === true || req.body.role || resetMfa) {
       await Session.updateMany({ userId: u._id, revokedAt: null }, { revokedAt: new Date() });
     }
     await audit(req, "user.update", String(u._id), req.body);

@@ -63,6 +63,8 @@ export function createApp() {
     limiter(15 * 60_000, 10, (req) => `id:${String(req.body?.identifier ?? "").toLowerCase().slice(0, 160)}`)
   );
   app.use("/api/v1/auth/refresh", limiter(15 * 60_000, 600));
+  // Codes de double authentification : peu d'essais par IP (le compte se bloque aussi après 5 échecs).
+  app.use("/api/v1/auth/mfa/verify", limiter(15 * 60_000, 30));
   // Génération de PDF/Word : opération coûteuse, limitée par utilisateur authentifié.
   app.use(/^\/api\/v1\/library\/resources\/[^/]+\/export\//, limiter(10 * 60_000, 60, (req) => `exp:${req.header("authorization")?.slice(-24) ?? req.ip}`));
 

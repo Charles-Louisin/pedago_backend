@@ -17,6 +17,13 @@ const userSchema = new Schema(
     emailCodeExpiresAt: { type: Date, select: false },
     emailCodeAttempts: { type: Number, default: 0, select: false },
     emailCodeSentAt: { type: Date, select: false },
+    /** Double authentification (obligatoire pour l'équipe : relecteurs et administrateurs). */
+    mfaEnabled: { type: Boolean, default: false },
+    mfaSecretEnc: { type: String, select: false },
+    mfaPendingEnc: { type: String, select: false },
+    mfaRecoveryHashes: { type: [String], select: false },
+    mfaLastStep: { type: Number, select: false },
+    mfaFailed: { type: Number, default: 0, select: false },
   },
   { timestamps: true }
 );
@@ -28,6 +35,8 @@ export const User = mongoose.model("User", userSchema);
 /** Une session par appareil ; le jeton de rafraîchissement est stocké haché et tourne à chaque usage. */
 const sessionSchema = new Schema(
   {
+    /** Session ouverte avec la double authentification (conservé à chaque renouvellement). */
+    mfa: { type: Boolean, default: false },
     userId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
     refreshHash: { type: String, required: true, unique: true },
     /** Empreintes des jetons déjà utilisés (détection de réutilisation). */

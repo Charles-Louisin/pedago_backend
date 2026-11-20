@@ -12,9 +12,13 @@
     "seed": "tsx scripts/seed.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "node --import tsx --test --test-concurrency=1 test/*.test.ts",
-    "start:cluster": "node dist/cluster.js"
+    "start:cluster": "node dist/cluster.js",
+    "backup": "tsx scripts/backup.ts",
+    "restore": "tsx scripts/restore.ts",
+    "load-test": "tsx scripts/load-test.ts"
   },
   "dependencies": {
+    "@node-rs/argon2": "^2.2.2",
     "bcryptjs": "^3.0.2",
     "compression": "^1.8.0",
     "cors": "^2.8.5",
@@ -24,6 +28,7 @@
     "express-rate-limit": "^7.5.0",
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.2",
+    "mongodb": "^6.22.0",
     "mongoose": "^8.18.0",
     "pdfkit": "^0.17.1",
     "pino": "^9.9.0",
@@ -32,6 +37,7 @@
     "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@types/autocannon": "^7.12.7",
     "@types/bcryptjs": "^2.4.6",
     "@types/compression": "^1.8.1",
     "@types/cors": "^2.8.17",
@@ -39,6 +45,7 @@
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^22.18.0",
     "@types/pdfkit": "^0.17.2",
+    "autocannon": "^9.0.0",
     "mongodb-memory-server": "^10.4.3",
     "nodemon": "^3.1.14",
     "tsx": "^4.20.5",

@@ -2,8 +2,9 @@ import type { NextFunction, Request, Response } from "express";
 import { Session } from "../models/user.js";
 import { verifyAccessToken, type Role } from "../utils/jwt.js";
 import { forbidden, unauthorized } from "../utils/http-error.js";
+import { env } from "../config/env.js";
 
-export type AuthedRequest = Request & { userId: string; role: Role; sessionId: string; emailVerified: boolean };
+export type AuthedRequest = Request & { userId: string; role: Role; sessionId: string; emailVerified: boolean; mfa: boolean };
 
 /**
  * Vérifie le jeton d'accès (courte durée) et que sa session n'a pas été révoquée.
@@ -24,6 +25,7 @@ export async function requireAuth(req: Request, _res: Response, next: NextFuncti
     r.role = payload.role;
     r.sessionId = payload.sid;
     r.emailVerified = Boolean(payload.ev);
+    r.mfa = Boolean(payload.mfa);
     next();
   } catch (err) {
     next(err);
@@ -43,6 +45,10 @@ export function requireRole(...roles: Role[]) {
   return (req: Request, _res: Response, next: NextFunction) => {
     const role = (req as AuthedRequest).role;
     if (!role || !roles.includes(role)) return next(forbidden("FORBIDDEN_ROLE", "Rôle insuffisant"));
+    // L'équipe (relecteurs, administrateurs) n'agit qu'après la double authentification.
+    if (role !== "teacher" && env.staffMfaRequired && !(req as AuthedRequest).mfa) {
+      return next(forbidden("MFA_REQUIRED", "Active puis valide la double authentification pour continuer"));
+    }
     next();
   };
 }

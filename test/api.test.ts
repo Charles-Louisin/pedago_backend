@@ -7,6 +7,8 @@ import { MongoMemoryServer } from "mongodb-memory-server";
 import { createApp } from "../src/app.js";
 import { seedDatabase } from "../src/seed/seed.js";
 import { LessonInstance, Resource, User } from "../src/models/index.js";
+import bcrypt from "bcryptjs";
+import { currentStep, totpAt } from "../src/utils/totp.js";
 
 let mongo: MongoMemoryServer;
 let server: Server;
@@ -22,6 +24,18 @@ async function call(path: string, init: { method?: string; token?: string; body?
 }
 
 const login = (identifier: string, password: string) => call("/auth/login", { method: "POST", body: { identifier, password } });
+
+/** Équipe : active la double authentification à la première connexion, puis réutilise la session. */
+const staff = new Map<string, string>();
+async function staffToken(email: string, password: string) {
+  if (staff.has(email)) return staff.get(email)!;
+  const first = await login(email, password);
+  const setup = await call("/auth/mfa/setup", { method: "POST", token: first.body.accessToken });
+  const on = await call("/auth/mfa/enable", { method: "POST", token: first.body.accessToken, body: { code: totpAt(setup.body.secret, currentStep()) } });
+  assert.equal(on.status, 200);
+  staff.set(email, on.body.accessToken);
+  return on.body.accessToken as string;
+}
 
 before(async () => {
   mongo = await MongoMemoryServer.create({ binary: { version: process.env.MONGOMS_VERSION || "8.2.6" } });
@@ -90,8 +104,8 @@ test("synchronisation idempotente : un même opId n'est appliqué qu'une fois", 
 });
 
 test("principe des quatre yeux et publication réservée à l'admin", async () => {
-  const admin = (await login("admin@pedago.test", "Pedago-Admin-2026!")).body.accessToken;
-  const reviewer = (await login("relecteur@pedago.test", "Pedago-Relecteur-2026!")).body.accessToken;
+  const admin = await staffToken("admin@pedago.test", "Pedago-Admin-2026!");
+  const reviewer = await staffToken("relecteur@pedago.test", "Pedago-Relecteur-2026!");
   const r = await Resource.findOne({ status: "PUBLISHED" });
   const id = String(r!._id);
   assert.equal((await call(`/admin/resources/${id}/revise`, { method: "POST", token: reviewer })).status, 403);
@@ -105,7 +119,7 @@ test("principe des quatre yeux et publication réservée à l'admin", async () =
 });
 
 test("sources : liste blanche, pas d'URL arbitraire ni de javascript:", async () => {
-  const admin = (await login("admin@pedago.test", "Pedago-Admin-2026!")).body.accessToken;
+  const admin = await staffToken("admin@pedago.test", "Pedago-Admin-2026!");
   const post = (body: object) => call("/admin/sources", { method: "POST", token: admin, body: { title: "Test source", issuer: "MINEDUB", ...body } });
   assert.equal((await post({ url: "https://evil.example.com/x.pdf" })).status, 400);
   assert.equal((await post({ fileUrl: "http://127.0.0.1:5100/api/v1/health" })).status, 400);
@@ -114,10 +128,51 @@ test("sources : liste blanche, pas d'URL arbitraire ni de javascript:", async ()
 });
 
 test("désactiver un compte ferme ses sessions immédiatement", async () => {
-  const admin = (await login("admin@pedago.test", "Pedago-Admin-2026!")).body.accessToken;
+  const admin = await staffToken("admin@pedago.test", "Pedago-Admin-2026!");
   const t = (await login("autre@pedago.test", "Pedago-Autre-2026!")).body.accessToken;
   assert.equal((await call("/teacher/me", { token: t })).status, 200);
   const other = await User.findOne({ email: "autre@pedago.test" });
   assert.equal((await call(`/admin/users/${other!._id}`, { method: "PATCH", token: admin, body: { disabled: true } })).status, 200);
   assert.equal((await call("/teacher/me", { token: t })).status, 401);
+});
+
+test("équipe : double authentification obligatoire, codes à usage unique, secours, renouvellement", async () => {
+  await User.create({ fullName: "Admin 2FA", email: "mfa@pedago.test", role: "admin", emailVerified: true, passwordHash: await bcrypt.hash("Pedago-Mfa-2026!", 12) });
+  const first = await login("mfa@pedago.test", "Pedago-Mfa-2026!");
+  assert.equal(first.status, 200);
+  // Ancien hachage bcrypt converti en Argon2id dès la connexion.
+  assert.match((await User.findOne({ email: "mfa@pedago.test" }).select("+passwordHash"))!.passwordHash, /^\$argon2id\$/);
+  // Sans 2FA : aucune action d'administration.
+  const blocked = await call("/admin/stats", { token: first.body.accessToken });
+  assert.equal(blocked.status, 403);
+  assert.equal(blocked.body.code, "MFA_REQUIRED");
+
+  const setup = await call("/auth/mfa/setup", { method: "POST", token: first.body.accessToken });
+  assert.match(setup.body.otpauthUrl, /^otpauth:\/\/totp\/PEDAGO/);
+  assert.equal((await call("/auth/mfa/enable", { method: "POST", token: first.body.accessToken, body: { code: "000000" } })).status, 400);
+  const step = currentStep();
+  const on = await call("/auth/mfa/enable", { method: "POST", token: first.body.accessToken, body: { code: totpAt(setup.body.secret, step) } });
+  assert.equal(on.status, 200);
+  assert.equal(on.body.recoveryCodes.length, 8);
+  assert.equal((await call("/admin/stats", { token: on.body.accessToken })).status, 200);
+
+  // Connexion suivante : le mot de passe seul ne suffit plus.
+  const pw = await login("mfa@pedago.test", "Pedago-Mfa-2026!");
+  assert.equal(pw.body.mfaRequired, true);
+  assert.equal(pw.body.accessToken, undefined);
+  // Le code déjà utilisé à l'activation est refusé (pas de rejeu).
+  assert.equal((await call("/auth/mfa/verify", { method: "POST", body: { mfaToken: pw.body.mfaToken, code: totpAt(setup.body.secret, step) } })).status, 401);
+  const ok = await call("/auth/mfa/verify", { method: "POST", body: { mfaToken: pw.body.mfaToken, code: totpAt(setup.body.secret, step + 1) } });
+  assert.equal(ok.status, 200);
+  // Le renouvellement conserve la 2FA.
+  const refreshed = await call("/auth/refresh", { method: "POST", body: { refreshToken: ok.body.refreshToken } });
+  assert.equal((await call("/admin/stats", { token: refreshed.body.accessToken })).status, 200);
+
+  // Code de secours : une seule fois.
+  const pw2 = await login("mfa@pedago.test", "Pedago-Mfa-2026!");
+  const rec = await call("/auth/mfa/verify", { method: "POST", body: { mfaToken: pw2.body.mfaToken, recoveryCode: on.body.recoveryCodes[0].toLowerCase() } });
+  assert.equal(rec.status, 200);
+  assert.equal(rec.body.recoveryCodesLeft, 7);
+  const pw3 = await login("mfa@pedago.test", "Pedago-Mfa-2026!");
+  assert.equal((await call("/auth/mfa/verify", { method: "POST", body: { mfaToken: pw3.body.mfaToken, recoveryCode: on.body.recoveryCodes[0] } })).status, 401);
 });

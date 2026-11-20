@@ -142,3 +142,36 @@ test("on ne peut pas attacher une fiche à la leçon personnelle d'un autre ense
   const res = await fetch(`${base}/api/v1/teacher/preps/${cur.body.lessons[0].id}`, { headers: { Authorization: `Bearer ${ver.accessToken}` } });
   assert.equal(res.status, 404);
 });
+
+test("mes données : export complet puis suppression définitive du compte (fichiers compris)", async () => {
+  const exp = await call("/teacher/me/export");
+  assert.equal(exp.status, 200);
+  assert.equal(exp.body.format, "pedago-export-v1");
+  assert.equal(exp.body.account.email, "enseignant@pedago.test");
+  assert.equal(exp.body.account.passwordHash, undefined);
+  assert.ok(exp.body.preps.length >= 1);
+  assert.ok(exp.body.curriculum.length >= 1);
+  assert.ok(exp.body.lessons.length >= 1);
+  assert.ok(exp.body.documents.length >= 1);
+  const files = exp.body.documents.map((d: { url: string }) => `${localExportsDir}/${d.url.split("/exports/")[1]}`);
+  assert.ok(files.every((f: string) => fs.existsSync(f)));
+
+  assert.equal((await call("/auth/me", { method: "DELETE", body: { password: "mauvais" } })).status, 400);
+  assert.equal((await call("/auth/me", { method: "DELETE", body: { password: "Pedago-Enseignant-2026!" } })).status, 204);
+
+  // Plus de session, plus de connexion, plus de données ni de fichiers.
+  assert.equal((await call("/teacher/me")).status, 401);
+  const relog = await fetch(`${base}/api/v1/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ identifier: "enseignant@pedago.test", password: "Pedago-Enseignant-2026!" }),
+  });
+  assert.equal(relog.status, 401);
+  const { LessonInstance, TeacherPrep, CurriculumNode, GeneratedDocument } = await import("../src/models/index.js");
+  const userId = exp.body.account._id;
+  assert.equal(await LessonInstance.countDocuments({ teacherId: userId }), 0);
+  assert.equal(await TeacherPrep.countDocuments({ teacherId: userId }), 0);
+  assert.equal(await CurriculumNode.countDocuments({ ownerId: userId }), 0);
+  assert.equal(await GeneratedDocument.countDocuments({ teacherId: userId }), 0);
+  assert.ok(files.every((f: string) => !fs.existsSync(f)));
+});
