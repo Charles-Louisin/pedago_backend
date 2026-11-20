@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { ALL_CLASS_LEVELS, CurriculumNode, DIFFICULTIES, LessonInstance, RESOURCE_TYPES, Resource, SourceDocument, TeacherProfile } from "../models/index.js";
-import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
+import { requireAuth, requireVerifiedEmail, type AuthedRequest } from "../middleware/auth.js";
 import { validate } from "../middleware/validate.js";
 import { ah, badRequest, notFound } from "../utils/http-error.js";
 import { ensureExport } from "../services/exports.js";
@@ -9,7 +9,7 @@ import { isLocalDate } from "../utils/dates.js";
 import { getCalendar } from "../services/planning.js";
 
 export const libraryRouter = Router();
-libraryRouter.use(requireAuth);
+libraryRouter.use(requireAuth, requireVerifiedEmail);
 
 const LIST_FIELDS = "_id type title summary classLevel subjectCode nodeId difficulty illustrationLevel durationMin contentVersion updatedAt";
 

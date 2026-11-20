@@ -1,5 +1,7 @@
 import { Router } from "express";
 import bcrypt from "bcryptjs";
+import crypto from "node:crypto";
+import { sendMail, verificationEmail } from "../services/mail.js";
 import { z } from "zod";
 import { Session, User, TeacherProfile, AuditLog } from "../models/index.js";
 import { validate } from "../middleware/validate.js";
@@ -16,12 +18,14 @@ const identifier = z.string().trim().min(3).max(160);
 const registerSchema = z
   .object({
     fullName: z.string().trim().min(2, "Nom trop court").max(120),
-    email: z.string().trim().toLowerCase().email("E-mail invalide").optional(),
+    // L'e-mail est obligatoire : il est vérifié par code et sert à récupérer le compte.
+    email: z.string().trim().toLowerCase().email("E-mail invalide"),
     phone: z.string().trim().regex(/^\+?\d{8,15}$/, "Téléphone invalide").optional(),
     password,
+    passwordConfirm: z.string().max(128),
     device: z.string().max(120).optional(),
   })
-  .refine((v) => v.email || v.phone, { message: "E-mail ou téléphone requis" });
+  .refine((v) => v.password === v.passwordConfirm, { message: "Les deux mots de passe ne correspondent pas", path: ["passwordConfirm"] });
 
 const loginSchema = z.object({ identifier, password: z.string().min(1).max(128), device: z.string().max(120).optional() });
 
@@ -29,7 +33,7 @@ let DUMMY_HASH: string | undefined;
 const MAX_FAILED = 5;
 const LOCK_MS = 15 * 60 * 1000;
 
-async function issueSession(user: { _id: unknown; role: string }, device?: string) {
+async function issueSession(user: { _id: unknown; role: string; emailVerified?: boolean | null }, device?: string) {
   const refreshToken = newRefreshToken();
   const session = await Session.create({
     userId: user._id,
@@ -38,7 +42,7 @@ async function issueSession(user: { _id: unknown; role: string }, device?: strin
     expiresAt: new Date(Date.now() + env.refreshTokenTtlDays * 86_400_000),
     lastUsedAt: new Date(),
   });
-  const accessToken = signAccessToken({ sub: String(user._id), role: user.role as Role, sid: String(session._id) });
+  const accessToken = signAccessToken({ sub: String(user._id), role: user.role as Role, sid: String(session._id), ev: Boolean(user.emailVerified) });
   return { accessToken, refreshToken, expiresIn: env.accessTokenTtlSec };
 }
 
@@ -49,6 +53,7 @@ export function toMe(user: any, profile: any) {
     email: user.email ?? null,
     phone: user.phone ?? null,
     role: user.role,
+    emailVerified: Boolean(user.emailVerified),
     profile: profile
       ? {
           subsystem: profile.subsystem,
@@ -65,6 +70,66 @@ export function toMe(user: any, profile: any) {
   };
 }
 
+const CODE_TTL_MS = 15 * 60_000;
+const CODE_MAX_ATTEMPTS = 5;
+
+/** Génère un code à 6 chiffres (stocké haché), l'envoie par e-mail ; renvoie le code (pour l'écho en développement). */
+async function sendVerificationCode(userId: string) {
+  const user = await User.findById(userId).select("+emailCodeSentAt");
+  if (!user?.email || user.emailVerified) return null;
+  if (user.emailCodeSentAt && Date.now() - user.emailCodeSentAt.getTime() < 45_000) {
+    throw new HttpError(429, "CODE_TOO_SOON", "Patiente quelques secondes avant de redemander un code");
+  }
+  const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, "0");
+  user.emailCodeHash = hashToken(code + userId);
+  user.emailCodeExpiresAt = new Date(Date.now() + CODE_TTL_MS);
+  user.emailCodeAttempts = 0;
+  user.emailCodeSentAt = new Date();
+  await user.save();
+  const mail = verificationEmail(user.fullName, code);
+  await sendMail(user.email, mail.subject, mail.html, mail.text);
+  return code;
+}
+
+authRouter.post(
+  "/verify-email",
+  requireAuth,
+  validate(z.object({ code: z.string().regex(/^\d{6}$/, "Code à 6 chiffres attendu") })),
+  ah(async (req, res) => {
+    const userId = (req as AuthedRequest).userId;
+    const user = await User.findById(userId).select("+emailCodeHash +emailCodeExpiresAt +emailCodeAttempts");
+    if (!user) throw unauthorized();
+    if (user.emailVerified) return res.json({ verified: true });
+    if (!user.emailCodeHash || !user.emailCodeExpiresAt || user.emailCodeExpiresAt < new Date()) {
+      throw badRequest("CODE_EXPIRED", "Code expiré : demande un nouveau code");
+    }
+    if ((user.emailCodeAttempts ?? 0) >= CODE_MAX_ATTEMPTS) throw badRequest("CODE_LOCKED", "Trop d'essais : demande un nouveau code");
+    const ok = crypto.timingSafeEqual(Buffer.from(user.emailCodeHash), Buffer.from(hashToken(req.body.code + userId)));
+    if (!ok) {
+      user.emailCodeAttempts = (user.emailCodeAttempts ?? 0) + 1;
+      await user.save();
+      throw badRequest("CODE_INVALID", `Code incorrect (${CODE_MAX_ATTEMPTS - user.emailCodeAttempts} essai(s) restant(s))`);
+    }
+    user.emailVerified = true;
+    user.emailCodeHash = undefined;
+    user.emailCodeExpiresAt = undefined;
+    await user.save();
+    // Nouveau jeton d'accès portant la vérification, utilisable immédiatement.
+    const r = req as AuthedRequest;
+    const accessToken = signAccessToken({ sub: r.userId, role: r.role, sid: r.sessionId, ev: true });
+    res.json({ verified: true, accessToken, expiresIn: env.accessTokenTtlSec });
+  })
+);
+
+authRouter.post(
+  "/resend-code",
+  requireAuth,
+  ah(async (req, res) => {
+    const code = await sendVerificationCode((req as AuthedRequest).userId);
+    res.json({ sent: Boolean(code), ...(env.devEchoCodes && code ? { devCode: code } : {}) });
+  })
+);
+
 authRouter.post(
   "/register",
   validate(registerSchema),
@@ -73,8 +138,9 @@ authRouter.post(
     const exists = await User.exists({ $or: [email ? { email } : null, phone ? { phone } : null].filter(Boolean) as object[] });
     if (exists) throw conflict("ACCOUNT_EXISTS", "Un compte existe déjà avec cet identifiant");
     const user = await User.create({ fullName, email, phone, passwordHash: await bcrypt.hash(password, 12), role: "teacher" });
+    const code = await sendVerificationCode(String(user._id));
     const tokens = await issueSession(user, device);
-    res.status(201).json({ ...tokens, user: toMe(user, null) });
+    res.status(201).json({ ...tokens, user: toMe(user, null), ...(env.devEchoCodes && code ? { devCode: code } : {}) });
   })
 );
 
@@ -146,7 +212,7 @@ authRouter.post(
     }
     const user = await User.findById(session.userId).lean();
     if (!user || user.disabled) throw unauthorized("Session expirée");
-    const accessToken = signAccessToken({ sub: String(user._id), role: user.role as Role, sid: String(session._id) });
+    const accessToken = signAccessToken({ sub: String(user._id), role: user.role as Role, sid: String(session._id), ev: Boolean(user.emailVerified) });
     res.json({ accessToken, refreshToken, expiresIn: env.accessTokenTtlSec });
   })
 );

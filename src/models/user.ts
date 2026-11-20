@@ -11,6 +11,12 @@ const userSchema = new Schema(
     failedLogins: { type: Number, default: 0, select: false },
     lockedUntil: { type: Date, select: false },
     lastLoginAt: Date,
+    /** Adresse e-mail confirmée par code à 6 chiffres. */
+    emailVerified: { type: Boolean, default: false },
+    emailCodeHash: { type: String, select: false },
+    emailCodeExpiresAt: { type: Date, select: false },
+    emailCodeAttempts: { type: Number, default: 0, select: false },
+    emailCodeSentAt: { type: Date, select: false },
   },
   { timestamps: true }
 );

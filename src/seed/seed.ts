@@ -206,8 +206,11 @@ export async function seedDatabase() {
     { email: process.env.SEED_TEACHER_EMAIL || "enseignant@pedago.test", password: process.env.SEED_TEACHER_PASSWORD || "Pedago-Enseignant-2026!", fullName: "Enseignant démo", role: "teacher" },
   ];
   for (const a of accounts) {
-    if (await User.exists({ email: a.email })) continue;
-    const user = await User.create({ email: a.email, fullName: a.fullName, role: a.role, passwordHash: await bcrypt.hash(a.password, 12) });
+    if (await User.exists({ email: a.email })) {
+      await User.updateOne({ email: a.email }, { emailVerified: true });
+      continue;
+    }
+    const user = await User.create({ email: a.email, fullName: a.fullName, role: a.role, emailVerified: true, passwordHash: await bcrypt.hash(a.password, 12) });
     if (a.role === "teacher") {
       await TeacherProfile.create({
         userId: user._id,

@@ -13,7 +13,7 @@ import {
   Timetable,
   User,
 } from "../models/index.js";
-import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
+import { requireAuth, requireVerifiedEmail, type AuthedRequest } from "../middleware/auth.js";
 import { validate } from "../middleware/validate.js";
 import { ah, badRequest, notFound } from "../utils/http-error.js";
 import { addDays, isLocalDate, minutesBetween } from "../utils/dates.js";
@@ -21,7 +21,7 @@ import { applyCatchUp, ensurePlan, proposeCatchUp } from "../services/planning.j
 import { toMe } from "./auth.js";
 
 export const teacherRouter = Router();
-teacherRouter.use(requireAuth);
+teacherRouter.use(requireAuth, requireVerifiedEmail);
 
 const uid = (req: unknown) => (req as AuthedRequest).userId;
 const localDate = z.string().refine(isLocalDate, "Date attendue au format AAAA-MM-JJ");

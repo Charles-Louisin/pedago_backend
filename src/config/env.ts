@@ -33,6 +33,11 @@ export const env = {
 
   uploadthingToken: str("UPLOADTHING_TOKEN"),
 
+  resendApiKey: str("RESEND_API_KEY"),
+  mailFrom: str("MAIL_FROM", "PEDAGO <onboarding@resend.dev>"),
+  /** Développement : le code de vérification est renvoyé dans la réponse pour tester sans boîte mail. */
+  devEchoCodes: !isProduction && bool("DEV_ECHO_CODES", true),
+
   /** Clé OpenRouter : utilisée uniquement côté serveur, jamais exposée à l'app mobile. */
   openrouterApiKey: str("OPENROUTER_API_KEY"),
   openrouterBaseUrl: str("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").replace(/\/$/, ""),

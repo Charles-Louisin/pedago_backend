@@ -37,6 +37,12 @@ after(async () => {
   await mongo.stop();
 });
 
+test("inscription : confirmation du mot de passe obligatoire", async () => {
+  const r = await call("/auth/register", { method: "POST", body: { fullName: "Test Confirm", email: "confirm@pedago.test", password: "Pedago-Test-2026!", passwordConfirm: "autre" } });
+  assert.equal(r.status, 400);
+  assert.match(r.body.message, /correspondent/);
+});
+
 test("rotation du jeton de rafraîchissement et détection de réutilisation", async () => {
   const first = await login("enseignant@pedago.test", "Pedago-Enseignant-2026!");
   assert.equal(first.status, 200);
@@ -51,8 +57,14 @@ test("rotation du jeton de rafraîchissement et détection de réutilisation", a
 test("un enseignant ne peut ni lire l'admin ni toucher aux séances d'un autre", async () => {
   const t = (await login("enseignant@pedago.test", "Pedago-Enseignant-2026!")).body.accessToken;
   assert.equal((await call("/admin/stats", { token: t })).status, 403);
-  const reg = await call("/auth/register", { method: "POST", body: { fullName: "Autre Enseignant", email: "autre@pedago.test", password: "Pedago-Autre-2026!" } });
+  const reg = await call("/auth/register", { method: "POST", body: { fullName: "Autre Enseignant", email: "autre@pedago.test", password: "Pedago-Autre-2026!", passwordConfirm: "Pedago-Autre-2026!" } });
   assert.equal(reg.status, 201);
+  // Tant que l'e-mail n'est pas confirmé, l'application est fermée.
+  assert.equal((await call("/teacher/catchup", { token: reg.body.accessToken })).status, 403);
+  assert.equal((await call("/auth/verify-email", { method: "POST", token: reg.body.accessToken, body: { code: "000000" } })).status, 400);
+  const ver = await call("/auth/verify-email", { method: "POST", token: reg.body.accessToken, body: { code: reg.body.devCode } });
+  assert.equal(ver.status, 200);
+  reg.body.accessToken = ver.body.accessToken;
   const owner = await User.findOne({ email: "enseignant@pedago.test" });
   const lesson = await LessonInstance.create({ teacherId: owner!._id, classLevel: "CP", subjectCode: "MATH", nodeId: new mongoose.Types.ObjectId(), date: "2026-11-23" });
   const sync = await call("/teacher/sync/events", {
