@@ -4,7 +4,10 @@ import { AiJob, AiUsageLog } from "../models/index.js";
 export class BudgetExceededError extends Error {}
 export class AiNotConfiguredError extends Error {}
 
-type Part = { type: "text"; text: string } | { type: "file"; file: { filename: string; file_data: string } };
+type Part =
+  | { type: "text"; text: string }
+  | { type: "file"; file: { filename: string; file_data: string } }
+  | { type: "image_url"; image_url: { url: string } };
 export type ChatMessage = { role: "system" | "user" | "assistant"; content: string | Part[] };
 
 type ChatInput = {

@@ -9,6 +9,7 @@ import {
   Session,
   TeacherPrep,
   TeacherProfile,
+  TeacherUpload,
   Timetable,
   User,
 } from "../models/index.js";
@@ -20,7 +21,7 @@ import { deleteStoredFile } from "./storage.js";
  */
 export async function exportAccount(userId: string) {
   const id = new Types.ObjectId(userId);
-  const [user, profile, timetables, lessons, events, catchups, preps, curriculum, documents, sessions] = await Promise.all([
+  const [user, profile, timetables, lessons, events, catchups, preps, curriculum, documents, sessions, uploads] = await Promise.all([
     User.findById(id).select("fullName email phone role emailVerified createdAt lastLoginAt").lean(),
     TeacherProfile.findOne({ userId: id }).lean(),
     Timetable.find({ teacherId: id }).lean(),
@@ -31,6 +32,7 @@ export async function exportAccount(userId: string) {
     CurriculumNode.find({ ownerId: id }).select("-__v").lean(),
     GeneratedDocument.find({ teacherId: id }).select("url sizeBytes createdAt").lean(),
     Session.find({ userId: id }).select("device createdAt lastUsedAt revokedAt").lean(),
+    TeacherUpload.find({ teacherId: id }).select("kind url name mime sizeBytes createdAt").lean(),
   ]);
   return {
     exportedAt: new Date().toISOString(),
@@ -44,6 +46,7 @@ export async function exportAccount(userId: string) {
     reports: events,
     catchUp: catchups,
     documents,
+    uploads,
     sessions,
   };
 }
@@ -52,13 +55,11 @@ export async function exportAccount(userId: string) {
 export async function deleteAccount(userId: string, ip?: string) {
   const id = new Types.ObjectId(userId);
   const docs = await GeneratedDocument.find({ teacherId: id }).select("url key").lean();
-  const prepFiles = await TeacherPrep.find({ teacherId: id, fileUrl: { $ne: null } }).select("fileUrl").lean();
-  await Promise.all([
-    ...docs.map((d) => deleteStoredFile(d.key, d.url)),
-    ...prepFiles.map((p) => deleteStoredFile(p.fileUrl!.split("/").pop()!, p.fileUrl!)),
-  ]);
+  const uploads = await TeacherUpload.find({ teacherId: id }).select("url key").lean();
+  await Promise.all([...docs.map((d) => deleteStoredFile(d.key, d.url)), ...uploads.map((u) => deleteStoredFile(u.key, u.url))]);
   await Promise.all([
     GeneratedDocument.deleteMany({ teacherId: id }),
+    TeacherUpload.deleteMany({ teacherId: id }),
     TeacherPrep.deleteMany({ teacherId: id }),
     CatchUpItem.deleteMany({ teacherId: id }),
     ProgressEvent.deleteMany({ teacherId: id }),

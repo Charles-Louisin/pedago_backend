@@ -1,4 +1,6 @@
 import { Router } from "express";
+import multer from "multer";
+import { analyzeImport, IMPORT_MAX_BYTES } from "../services/imports.js";
 import { z } from "zod";
 import { exportAccount } from "../services/account.js";
 import {
@@ -12,6 +14,7 @@ import {
   Subject,
   TeacherProfile,
   TeacherPrep,
+  TeacherUpload,
   Timetable,
   User,
 } from "../models/index.js";
@@ -638,6 +641,27 @@ teacherRouter.get(
   })
 );
 
+/**
+ * Import d'une progression ou d'une fiche (PDF ou photo) : renvoie les données lues, sans rien enregistrer.
+ * L'enseignant vérifie, puis valide avec PUT /curriculum ou PUT /preps/:nodeId.
+ */
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: IMPORT_MAX_BYTES, files: 1, fields: 4 } });
+teacherRouter.post(
+  "/imports",
+  (req, res, next) =>
+    upload.single("file")(req, res, (err: unknown) => {
+      if (err) return next((err as { code?: string }).code === "LIMIT_FILE_SIZE" ? badRequest("FILE_TOO_LARGE", "Fichier trop lourd (10 Mo maximum)") : badRequest("UPLOAD_INVALID", "Envoi invalide"));
+      next();
+    }),
+  ah(async (req, res) => {
+    const kind = z.enum(["curriculum", "prep"]).safeParse(req.body?.kind);
+    if (!kind.success) throw badRequest("IMPORT_KIND", "Type d'import inconnu");
+    const file = (req as typeof req & { file?: Express.Multer.File }).file;
+    if (!file) throw badRequest("FILE_REQUIRED", "Ajoute un PDF ou une photo");
+    res.json(await analyzeImport({ teacherId: uid(req), kind: kind.data, buffer: file.buffer, name: file.originalname }));
+  })
+);
+
 teacherRouter.get(
   "/preps/:nodeId",
   ah(async (req, res) => {
@@ -649,12 +673,15 @@ teacherRouter.get(
 
 teacherRouter.put(
   "/preps/:nodeId",
-  validate(z.object({ content: prepContent, fileUrl: z.string().url().refine((u) => /^https:\/\/([a-z0-9-]+\.)*(ufs\.sh|utfs\.io)\//i.test(u), "Fichier non autorisé").optional(), fileName: z.string().max(200).optional() })),
+  // Le fichier d'origine se désigne par l'identifiant de son dépôt : seul un fichier de l'enseignant lui-même est accepté.
+  validate(z.object({ content: prepContent, uploadId: z.string().regex(/^[a-f\d]{24}$/i).optional() })),
   ah(async (req, res) => {
     await ownNode(uid(req), String(req.params.nodeId));
+    const upload = req.body.uploadId ? await TeacherUpload.findOne({ _id: req.body.uploadId, teacherId: uid(req), kind: "prep" }).lean() : null;
+    if (req.body.uploadId && !upload) throw notFound("Fichier introuvable");
     const prep = await TeacherPrep.findOneAndUpdate(
       { teacherId: uid(req), nodeId: req.params.nodeId },
-      { content: req.body.content, ...(req.body.fileUrl ? { fileUrl: req.body.fileUrl, fileName: req.body.fileName } : {}) },
+      { content: req.body.content, ...(upload ? { fileUrl: upload.url, fileName: upload.name ?? "fiche", fileMime: upload.mime } : {}) },
       { upsert: true, new: true }
     ).lean();
     res.json({ content: prep.content, fileName: prep.fileName ?? null, updatedAt: prep.updatedAt });

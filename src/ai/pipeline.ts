@@ -52,6 +52,8 @@ export const STEPS: Record<AiJobKind, string[]> = {
   review_resource: ["load_resource", "ai_review"],
   extract_source: ["fetch", "extract", "save_nodes"],
   build_library: ["list_nodes", "enqueue_generations"],
+  // Import d'une fiche ou d'une progression : traité immédiatement par l'API, jamais par le worker.
+  teacher_import: ["extract"],
 };
 
 export function generationKey(p: {

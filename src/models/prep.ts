@@ -30,3 +30,22 @@ const generatedDocumentSchema = new Schema(
   { timestamps: true }
 );
 export const GeneratedDocument = mongoose.model("GeneratedDocument", generatedDocumentSchema);
+
+/**
+ * Fichier déposé par l'enseignant (sa fiche en PDF ou en photo) : rattaché à son auteur,
+ * effacé avec son compte. Une fiche ne peut citer qu'un fichier de son propre auteur.
+ */
+const teacherUploadSchema = new Schema(
+  {
+    teacherId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    kind: { type: String, enum: ["prep", "curriculum"], required: true },
+    url: { type: String, required: true },
+    key: { type: String, required: true },
+    name: { type: String, maxlength: 200 },
+    mime: String,
+    sizeBytes: Number,
+    sha256: String,
+  },
+  { timestamps: true }
+);
+export const TeacherUpload = mongoose.model("TeacherUpload", teacherUploadSchema);

@@ -143,6 +143,61 @@ test("on ne peut pas attacher une fiche à la leçon personnelle d'un autre ense
   assert.equal(res.status, 404);
 });
 
+/** PDF de test contenant du texte (comme une progression ou une fiche tapée à l'ordinateur). */
+async function pdfWith(lines: string[]) {
+  const PDFDocument = (await import("pdfkit")).default;
+  const doc = new PDFDocument();
+  const chunks: Buffer[] = [];
+  doc.on("data", (c: Buffer) => chunks.push(c));
+  const done = new Promise<Buffer>((r) => doc.on("end", () => r(Buffer.concat(chunks))));
+  for (const l of lines) doc.text(l);
+  doc.end();
+  return done;
+}
+
+async function upload(kind: string, data: Buffer, name: string, type: string) {
+  const form = new FormData();
+  form.append("kind", kind);
+  form.append("file", new Blob([new Uint8Array(data)], { type }), name);
+  const res = await fetch(`${base}/api/v1/teacher/imports`, { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: form });
+  return { status: res.status, body: (await res.json().catch(() => ({}))) as any };
+}
+
+test("import : progression et fiche en PDF lues sans IA, photo refusée tant que l'IA est inactive", async () => {
+  const prog = await upload("curriculum", await pdfWith(["TRIMESTRE 1", "1. Les nombres de 0 à 20", "2. L'addition posée : poser ; calculer", "Trimestre 2", "- La soustraction"]), "progression.pdf", "application/pdf");
+  assert.equal(prog.status, 200);
+  assert.equal(prog.body.source, "text");
+  assert.deepEqual(prog.body.data.lessons.map((l: { title: string; term: number }) => [l.title, l.term]), [
+    ["Les nombres de 0 à 20", 1],
+    ["L'addition posée", 1],
+    ["La soustraction", 2],
+  ]);
+
+  const prep = await upload("prep", await pdfWith(["Objectifs :", "- Additionner deux nombres", "Matériel : capsules, ardoises", "Trace écrite", "3 + 2 = 5"]), "ma-fiche.pdf", "application/pdf");
+  assert.equal(prep.status, 200);
+  assert.deepEqual(prep.body.data.objectives, ["Additionner deux nombres"]);
+  assert.deepEqual(prep.body.data.materials, ["capsules", "ardoises"]);
+  assert.ok(prep.body.uploadId);
+
+  // La fiche lue s'enregistre avec son fichier d'origine.
+  const plan = await call("/teacher/planning?from=2026-11-23&to=2026-11-27");
+  const nodeId = plan.body.lessons[0].node.id;
+  assert.equal((await call(`/teacher/preps/${nodeId}`, { method: "PUT", body: { content: prep.body.data, uploadId: prep.body.uploadId } })).status, 200);
+  const saved = await call(`/teacher/preps/${nodeId}`);
+  assert.match(saved.body.fileUrl, /\/exports\/.*fiche-source-/);
+  assert.equal(saved.body.fileName, "ma-fiche.pdf");
+  // Un identifiant de fichier inconnu (ou d'un autre compte) est refusé.
+  assert.equal((await call(`/teacher/preps/${nodeId}`, { method: "PUT", body: { content: {}, uploadId: "0123456789abcdef01234567" } })).status, 404);
+
+  // Photo : demande l'IA (non configurée ici) → message clair, rien n'est enregistré.
+  const png = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478da63f8ffff3f0005fe02fea7d6a4d80000000049454e44ae426082", "hex");
+  const photo = await upload("prep", png, "photo.png", "image/png");
+  assert.equal(photo.status, 503);
+  assert.equal(photo.body.code, "AI_NOT_CONFIGURED");
+  // Le type réel compte, pas le nom : un texte renommé en .pdf est refusé.
+  assert.equal((await upload("curriculum", Buffer.from("pas un pdf"), "faux.pdf", "application/pdf")).status, 415);
+});
+
 test("mes données : export complet puis suppression définitive du compte (fichiers compris)", async () => {
   const exp = await call("/teacher/me/export");
   assert.equal(exp.status, 200);
