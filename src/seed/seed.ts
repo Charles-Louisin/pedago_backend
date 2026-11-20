@@ -200,6 +200,39 @@ export async function seedDatabase() {
     }
   }
 
+  // Remédiation de démonstration : une fiche par leçon du programme officiel (ajoutée une seule fois).
+  if (!(await Resource.exists({ type: "remediation", origin: "seed" }))) {
+    const nodes = await CurriculumNode.find({ ownerId: null, curriculumVersion: "demo-2026", kind: "lesson" }).lean();
+    await Resource.insertMany(
+      nodes.map((node) => {
+        const content = demoContent(node.title, node.objectives, 30);
+        return {
+          type: "remediation",
+          subsystem: node.subsystem,
+          classLevel: node.classLevel,
+          subjectCode: node.subjectCode,
+          nodeId: node._id,
+          title: `Consolider : ${node.title}`,
+          summary: "Exercices plus simples et activité concrète (démonstration).",
+          durationMin: 30,
+          difficulty: "easy",
+          content: {
+            ...content,
+            steps: [
+              { name: "Rappel concret", durationMin: 10, teacherActivities: ["Reprend la notion avec des objets du quotidien"], learnerActivities: ["Manipulent et verbalisent"] },
+              { name: "Petits pas", durationMin: 15, teacherActivities: ["Propose des exercices très guidés"], learnerActivities: ["Travaillent en binômes"] },
+              { name: "Mini-contrôle", durationMin: 5, teacherActivities: ["Pose une question par élève"], learnerActivities: ["Répondent sur ardoise"] },
+            ],
+          },
+          curriculumVersion: "demo-2026",
+          origin: "seed",
+          status: "PUBLISHED",
+          publishedAt: new Date(),
+        };
+      })
+    );
+  }
+
   const accounts = [
     { email: process.env.SEED_ADMIN_EMAIL || "admin@pedago.test", password: process.env.SEED_ADMIN_PASSWORD || "Pedago-Admin-2026!", fullName: "Administrateur PEDAGO", role: "admin" },
     { email: process.env.SEED_REVIEWER_EMAIL || "relecteur@pedago.test", password: process.env.SEED_REVIEWER_PASSWORD || "Pedago-Relecteur-2026!", fullName: "Relecteur pédagogique", role: "reviewer" },

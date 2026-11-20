@@ -99,7 +99,15 @@ export async function ensurePlan(teacherId: string, classLevel: string, schoolYe
 type Option =
   | { kind: "insert_next_slot"; date: string; start: string; lessonId: string; shifted: number; label: string }
   | { kind: "replace_low_priority"; date: string; start: string; lessonId: string; replacedTitle: string; label: string }
+  | { kind: "split_two_slots"; date: string; start: string; lessonId: string; secondDate: string; label: string }
   | { kind: "drop"; label: string };
+
+/** Objectifs restant à traiter : ceux notés au bilan partiel, ou tous si la leçon n'a pas été faite. */
+async function remainingOf(item: { nodeId: unknown; remainingObjectives?: number[] | null }) {
+  if (item.remainingObjectives?.length) return [...item.remainingObjectives];
+  const node = await CurriculumNode.findById(item.nodeId, { objectives: 1 }).lean();
+  return (node?.objectives ?? []).map((_, i) => i);
+}
 
 /**
  * Moteur de rattrapage : propose des options, l'enseignant confirme toujours.
@@ -135,6 +143,18 @@ export async function proposeCatchUp(teacherId: string, itemId: string, today: s
       lessonId: String(next._id),
       shifted: future.length,
       label: `Placer au prochain cours (${next.date} à ${next.start}) et décaler la suite d'une séance`,
+    });
+  }
+  // Leçon trop longue pour un seul créneau : la moitié des objectifs à chacun des deux prochains cours.
+  const second = future[1];
+  if (next && second && (await remainingOf(item)).length >= 2) {
+    options.push({
+      kind: "split_two_slots",
+      date: next.date,
+      start: next.start ?? "",
+      lessonId: String(next._id),
+      secondDate: second.date,
+      label: `Répartir sur deux séances (${next.date} et ${second.date}) et décaler la suite de deux séances`,
     });
   }
   const horizon = addDays(today, 14);
@@ -202,7 +222,8 @@ export async function applyCatchUp(teacherId: string, itemId: string, option: Op
       })
     );
   } else {
-    // insert_next_slot : on fait glisser les leçons suivantes d'un créneau.
+    // insert_next_slot : la leçon prend le prochain créneau, les suivantes glissent d'un créneau.
+    // split_two_slots : elle prend les deux prochains (objectifs partagés), la suite glisse de deux.
     const chain = await LessonInstance.find({
       teacherId,
       classLevel: target.classLevel,
@@ -210,20 +231,36 @@ export async function applyCatchUp(teacherId: string, itemId: string, option: Op
       status: "planned",
       $or: [{ date: { $gt: target.date } }, { date: target.date, start: { $gte: target.start } }],
     }).sort({ date: 1, start: 1 });
-    let carry = item.nodeId as Types.ObjectId;
+    let inserts: number[][];
+    if (option === "split_two_slots") {
+      const left = await remainingOf(item);
+      if (left.length < 2 || chain.length < 2) return null;
+      const half = Math.ceil(left.length / 2);
+      inserts = [left.slice(0, half), left.slice(half)];
+    } else {
+      inserts = [item.remainingObjectives ?? []];
+    }
+    // File d'attente : d'abord la (ou les) partie(s) à rattraper, puis chaque leçon déplacée.
+    const queue: { nodeId: Types.ObjectId; catchUp?: number[]; origin?: string; remaining?: number[] }[] = inserts.map((objs) => ({
+      nodeId: item.nodeId as Types.ObjectId,
+      catchUp: objs,
+    }));
     for (const lesson of chain) {
-      const current = lesson.nodeId as Types.ObjectId;
-      lesson.nodeId = carry;
+      queue.push({ nodeId: lesson.nodeId as Types.ObjectId, origin: lesson.origin, remaining: lesson.remainingObjectives ?? [] });
+      const next = queue.shift()!;
+      lesson.nodeId = next.nodeId;
       lesson.rev += 1;
-      if (String(carry) === String(item.nodeId)) {
+      if (next.catchUp) {
         lesson.origin = "catchup";
         lesson.catchUpOf = item.lessonId;
-        lesson.remainingObjectives = item.remainingObjectives;
+        lesson.remainingObjectives = next.catchUp;
+      } else {
+        lesson.origin = (next.origin as typeof lesson.origin) ?? "plan";
+        lesson.remainingObjectives = next.remaining ?? [];
       }
       await lesson.save();
-      carry = current;
     }
-    // La dernière leçon déplacée sera replacée par ensurePlan au prochain créneau libre (curseur).
+    // Les leçons poussées en fin de chaîne seront replacées par ensurePlan au prochain créneau libre (curseur).
   }
   item.status = "scheduled";
   item.scheduledLessonId = target._id;

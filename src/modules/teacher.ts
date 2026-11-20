@@ -388,7 +388,7 @@ teacherRouter.get(
 teacherRouter.post(
   "/catchup/:id/apply",
   validate(
-    z.object({ kind: z.enum(["insert_next_slot", "replace_low_priority", "drop"]), lessonId: z.string().regex(/^[a-f\d]{24}$/i).optional() })
+    z.object({ kind: z.enum(["insert_next_slot", "split_two_slots", "replace_low_priority", "drop"]), lessonId: z.string().regex(/^[a-f\d]{24}$/i).optional() })
   ),
   ah(async (req, res) => {
     const out = await applyCatchUp(uid(req), String(req.params.id), req.body.kind, req.body.lessonId);
@@ -475,6 +475,7 @@ teacherRouter.get(
           durationMin: e?.durationMin ?? null,
           note: e?.note ?? null,
           difficulties: e?.difficulties ?? null,
+          toRedo: e?.toRedo ?? null,
         };
       })
     );

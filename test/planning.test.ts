@@ -91,3 +91,25 @@ test("une autre personne ne peut pas appliquer le rattrapage", async () => {
   const item = await CatchUpItem.findOne({ teacherId });
   assert.equal(await proposeCatchUp(other, String(item!._id), "2026-11-23"), null);
 });
+
+test("rattrapage : répartir une leçon sur deux séances, objectifs partagés, rien ne se perd", async () => {
+  // Leçon du 30/11 manquée : ses 2 objectifs sont répartis sur les deux prochains cours.
+  const missed = await LessonInstance.findOne({ teacherId, date: "2026-11-30", status: "planned" });
+  missed!.status = "missed";
+  await missed!.save();
+  const item = await CatchUpItem.create({ teacherId, lessonId: missed!._id, nodeId: missed!.nodeId, classLevel: "CP", subjectCode: "MATH", reason: "missed" });
+  const before = (await LessonInstance.find({ teacherId, status: "planned", date: { $gt: "2026-11-30" } }).sort({ date: 1, start: 1 }).lean()).map((l) => String(l.nodeId));
+
+  const proposal = await proposeCatchUp(teacherId, String(item._id), "2026-11-30");
+  const split = proposal!.options.find((o) => o.kind === "split_two_slots") as { lessonId: string } | undefined;
+  assert.ok(split, "l'option de répartition est proposée");
+  await applyCatchUp(teacherId, String(item._id), "split_two_slots", split.lessonId);
+
+  const after = await LessonInstance.find({ teacherId, status: "planned", date: { $gt: "2026-11-30" } }).sort({ date: 1, start: 1 }).lean();
+  assert.equal(String(after[0].nodeId), String(missed!.nodeId));
+  assert.equal(String(after[1].nodeId), String(missed!.nodeId));
+  assert.deepEqual([after[0].remainingObjectives, after[1].remainingObjectives], [[0], [1]]);
+  assert.equal(after[0].origin, "catchup");
+  // Les leçons qui occupaient ces créneaux glissent de deux, dans le même ordre.
+  assert.deepEqual(after.slice(2).map((l) => String(l.nodeId)), before.slice(0, after.length - 2));
+});
