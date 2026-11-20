@@ -604,6 +604,22 @@ async function ownNode(teacherId: string, nodeId: string) {
   return node;
 }
 
+/** Liste des fiches de l'enseignant (titre et matière de la leçon), la plus récente d'abord. */
+teacherRouter.get(
+  "/preps",
+  ah(async (req, res) => {
+    const preps = await TeacherPrep.find({ teacherId: uid(req) }, { nodeId: 1, fileName: 1, updatedAt: 1 }).sort({ updatedAt: -1 }).limit(300).lean();
+    const nodes = await CurriculumNode.find({ _id: { $in: preps.map((p) => p.nodeId) } }, { title: 1, subjectCode: 1, classLevel: 1, order: 1 }).lean();
+    const byId = new Map(nodes.map((n) => [String(n._id), n]));
+    res.json(
+      preps.flatMap((p) => {
+        const n = byId.get(String(p.nodeId));
+        return n ? [{ nodeId: String(n._id), title: n.title, subjectCode: n.subjectCode, classLevel: n.classLevel, order: n.order, updatedAt: p.updatedAt }] : [];
+      })
+    );
+  })
+);
+
 teacherRouter.get(
   "/preps/:nodeId",
   ah(async (req, res) => {

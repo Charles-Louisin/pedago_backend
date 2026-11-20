@@ -51,7 +51,12 @@ export function parseProgression(text: string): ParsedLesson[] {
     }
     rest = rest.replace(/^(?:[-*•–·]|\d{1,3}\s*[.)\-–]|leçon\s*\d+\s*[:.\-–]?|lesson\s*\d+\s*[:.\-–]?)\s*/i, "").trim();
     if (rest.length < 3) continue;
-    const [title, objs] = rest.split(/\s*:\s+/, 2);
+    // « Titre : objectif ; objectif » — mais « Lecture : la famille de Mbarga » reste un seul titre.
+    const colon = rest.search(/\s*:\s+/);
+    const head = colon > 0 ? rest.slice(0, colon) : rest;
+    const tail = colon > 0 ? rest.slice(colon).replace(/^\s*:\s+/, "") : "";
+    const split = colon > 0 && (tail.includes(";") || head.split(/\s+/).length >= 3);
+    const [title, objs] = split ? [head, tail] : [rest, ""];
     out.push({
       title: title.slice(0, 200),
       objectives: objs ? objs.split(/\s*;\s*/).map((o) => o.trim()).filter((o) => o.length > 2).slice(0, 10) : [],

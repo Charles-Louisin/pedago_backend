@@ -31,6 +31,8 @@ type Doc = {
   /** En-tête de fiche : paires libellé / valeur (enseignant, école, date…). */
   meta?: [string, string][];
   includeAnswers?: boolean;
+  /** Remarques personnelles de l'enseignant. */
+  remarks?: string;
 };
 
 function sections(d: Doc) {
@@ -50,13 +52,14 @@ function sections(d: Doc) {
     });
   if (c.writtenTrace) out.push({ heading: "Trace écrite", lines: [c.writtenTrace] });
   if (c.body) out.push({ heading: "Contenu", lines: c.body.split("\n") });
-  if (c.exercises.length)
-    out.push({ heading: "Exercices d'application", lines: c.exercises.map((e, i) => `${i + 1}. ${e.prompt}${e.points ? ` (${e.points} pts)` : ""}`) });
-  if (c.assessment.length)
-    out.push({ heading: "Évaluation", lines: c.assessment.map((e, i) => `${i + 1}. ${e.prompt}${e.points ? ` (${e.points} pts)` : ""}`) });
+  const item = (e: { prompt: string; points?: number; illustration?: string }, i: number) =>
+    `${i + 1}. ${e.prompt}${e.points ? ` (${e.points} pts)` : ""}${e.illustration ? `\n    Illustration : ${e.illustration}` : ""}`;
+  if (c.exercises.length) out.push({ heading: "Exercices d'application", lines: c.exercises.map(item) });
+  if (c.assessment.length) out.push({ heading: "Évaluation", lines: c.assessment.map(item) });
   const answers = [...c.exercises, ...c.assessment];
   if (answers.length && d.includeAnswers !== false)
     out.push({ heading: "Corrigé", lines: answers.map((e, i) => `${i + 1}. ${e.answer}${e.explanation ? ` — ${e.explanation}` : ""}`) });
+  if (d.remarks) out.push({ heading: "Remarques", lines: d.remarks.split("\n") });
   if (c.lowResourceAlternatives.length)
     out.push({ heading: "Sans électricité ni matériel spécialisé", lines: c.lowResourceAlternatives.map((o) => `• ${o}`) });
   if (c.largeClassTips.length) out.push({ heading: "Pour une classe nombreuse", lines: c.largeClassTips.map((o) => `• ${o}`) });
@@ -219,7 +222,7 @@ async function generateExport(resourceId: string, format: "pdf" | "docx") {
     sources: sources.map((s) => `${s.issuer} — ${s.title}${s.url ? ` (${s.url})` : ""}`),
   };
   const data = format === "pdf" ? await renderPdf(doc) : await renderDocx(doc);
-  const slug = r.title.toLowerCase().normalize("NFD").replace(/[^\w]+/g, "-").slice(0, 60);
+  const slug = r.title.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^\w]+/g, "-").replace(/^-|-$/g, "").slice(0, 60);
   const stored = await storeFile(
     `${slug}-v${r.contentVersion}.${format}`,
     data,
@@ -285,8 +288,7 @@ export async function buildLessonDocument(o: {
   if (p.steps?.length) base.steps = p.steps;
   if (p.writtenTrace) base.writtenTrace = p.writtenTrace;
   if (p.exercises?.length) base.exercises = p.exercises.map((e) => ({ prompt: e.prompt, answer: e.answer || "—" }));
-  if (p.notes) base.body = p.notes;
-  else if (base.body?.startsWith("CONTENU DE DÉMONSTRATION")) base.body = undefined;
+  if (base.body?.startsWith("CONTENU DE DÉMONSTRATION")) base.body = undefined;
 
   // Niveau d'illustration : « simples » retire les descriptions d'images, les autres les gardent.
   if (o.illustrationLevel === "simple") {
@@ -308,6 +310,7 @@ export async function buildLessonDocument(o: {
     contentVersion: 1,
     content: base,
     includeAnswers: o.includeAnswers,
+    remarks: p.notes,
     sources: plan ? [`Bibliothèque PEDAGO${plan.approvedAt ? " (validée)" : ""}`] : [],
     meta: [
       ["Enseignant", o.teacherName],
@@ -321,7 +324,7 @@ export async function buildLessonDocument(o: {
     ],
   };
   const data = o.format === "pdf" ? await renderPdf(doc) : await renderDocx(doc);
-  const slug = node.title.toLowerCase().normalize("NFD").replace(/[^\w]+/g, "-").slice(0, 50);
+  const slug = node.title.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^\w]+/g, "-").replace(/^-|-$/g, "").slice(0, 50);
   // Nom imprévisible : la fiche personnelle n'est accessible qu'avec le lien reçu.
   const stored = await storeFile(
     `fiche-${slug}-${o.lesson.date}-${crypto.randomBytes(8).toString("hex")}.${o.format}`,

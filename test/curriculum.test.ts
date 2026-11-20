@@ -59,6 +59,8 @@ Trimestre 2
   ]);
   assert.deepEqual(lessons[0].objectives, ["compter", "écrire"]);
   assert.equal(lessons[0].week, 1);
+  // Un titre court suivi de « : » est un titre complet, pas un titre + objectif.
+  assert.deepEqual(parseProgression("4. Lecture : la famille de Mbarga")[0], { title: "Lecture : la famille de Mbarga", objectives: [], term: null, week: null });
 });
 
 test("rapprochement de titres proches", () => {
@@ -116,6 +118,13 @@ test("ma fiche prime sur la bibliothèque dans le PDF généré", async () => {
   const file = `${localExportsDir}/${doc.body.url.split("/exports/")[1]}`;
   assert.ok(fs.statSync(file).size > 1000);
   assert.equal(fs.readFileSync(file).subarray(0, 4).toString(), "%PDF");
+  // Nom de fichier lisible : accents retirés, pas de « re-vision ».
+  assert.match(doc.body.url, /-fiche-[a-z0-9-]+-\d{4}-\d{2}-\d{2}-[0-9a-f]{16}\.pdf$/);
+
+  // La fiche apparaît dans « Mes fiches », avec le titre de la leçon.
+  const mine = await call("/teacher/preps");
+  assert.equal(mine.status, 200);
+  assert.ok(mine.body.some((p: { nodeId: string; title: string }) => p.nodeId === lesson.node.id && p.title === lesson.node.title));
 });
 
 test("on ne peut pas attacher une fiche à la leçon personnelle d'un autre enseignant", async () => {
