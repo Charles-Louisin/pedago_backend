@@ -39,11 +39,18 @@ const curriculumNodeSchema = new Schema(
     sourceRefs: [{ _id: false, sourceId: { type: Schema.Types.ObjectId, ref: "SourceDocument" }, pages: [Number] }],
     curriculumVersion: { type: String, required: true },
     status: { type: String, enum: ["extracted", "validated", "retired"], default: "extracted" },
+    /** Progression personnelle d'un enseignant (absent = programme officiel). */
+    ownerId: { type: Schema.Types.ObjectId, ref: "User", default: null },
+    /** Leçon officielle correspondante (pour retrouver les ressources de la bibliothèque). */
+    matchedNodeId: { type: Schema.Types.ObjectId, ref: "CurriculumNode" },
+    /** Leçon déjà enseignée avant l'import de la progression (non replanifiée, comptée comme faite). */
+    alreadyTaught: { type: Boolean, default: false },
   },
   { timestamps: true }
 );
 curriculumNodeSchema.index({ subsystem: 1, classLevel: 1, subjectCode: 1, order: 1 });
 curriculumNodeSchema.index({ parentId: 1 });
+curriculumNodeSchema.index({ ownerId: 1, classLevel: 1, subjectCode: 1, order: 1 });
 export const CurriculumNode = mongoose.model("CurriculumNode", curriculumNodeSchema);
 
 /** Calendrier scolaire versionné : trimestres, congés, examens. */

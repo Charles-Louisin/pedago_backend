@@ -162,7 +162,7 @@ adminRouter.get(
     "query"
   ),
   ah(async (req, res) => {
-    const nodes = await CurriculumNode.find(req.query as Record<string, string>).sort({ classLevel: 1, subjectCode: 1, order: 1 }).limit(1000).lean();
+    const nodes = await CurriculumNode.find({ ...(req.query as Record<string, string>), ownerId: null }).sort({ classLevel: 1, subjectCode: 1, order: 1 }).limit(1000).lean();
     res.json(nodes);
   })
 );

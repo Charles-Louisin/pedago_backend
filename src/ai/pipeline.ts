@@ -362,7 +362,7 @@ const handlers: Record<string, (ctx: StepCtx) => Promise<StepResult>> = {
   /* build_library */
   async list_nodes({ job }) {
     const p = buildLibraryParams.parse(job.params);
-    const filter: Record<string, unknown> = { classLevel: p.classLevel, subjectCode: p.subjectCode, kind: "lesson", status: "validated" };
+    const filter: Record<string, unknown> = { classLevel: p.classLevel, subjectCode: p.subjectCode, kind: "lesson", status: "validated", ownerId: null };
     if (p.term) filter.term = p.term;
     const ids = await CurriculumNode.find(filter).sort({ order: 1 }).distinct("_id");
     return { output: { nodeIds: ids.map(String) } };

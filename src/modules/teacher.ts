@@ -10,6 +10,7 @@ import {
   Resource,
   Subject,
   TeacherProfile,
+  TeacherPrep,
   Timetable,
   User,
 } from "../models/index.js";
@@ -18,6 +19,8 @@ import { validate } from "../middleware/validate.js";
 import { ah, badRequest, notFound } from "../utils/http-error.js";
 import { addDays, isLocalDate, minutesBetween } from "../utils/dates.js";
 import { applyCatchUp, ensurePlan, proposeCatchUp } from "../services/planning.js";
+import { lessonsFor, parseProgression, resetTeacherCurriculum, saveTeacherCurriculum } from "../services/curriculum.js";
+import { buildLessonDocument } from "../services/exports.js";
 import { toMe } from "./auth.js";
 
 export const teacherRouter = Router();
@@ -159,12 +162,14 @@ teacherRouter.put(
 /* ───────────── Programme du jour / plage ───────────── */
 
 async function resourcesFor(nodeIds: unknown[], prefs: { difficulty?: string; illustrationLevel?: string }) {
-  const resources = await Resource.find({ nodeId: { $in: nodeIds }, status: "PUBLISHED" })
+  const own = await CurriculumNode.find({ _id: { $in: nodeIds }, matchedNodeId: { $ne: null } }).select("_id matchedNodeId").lean();
+  const alias = new Map(own.map((n) => [String(n.matchedNodeId), String(n._id)]));
+  const resources = await Resource.find({ nodeId: { $in: [...nodeIds, ...own.map((n) => n.matchedNodeId)] }, status: "PUBLISHED" })
     .select("_id nodeId type title difficulty illustrationLevel contentVersion assets.pdf.sizeBytes assets.docx.sizeBytes")
     .lean();
   const byNode = new Map<string, typeof resources>();
   for (const r of resources) {
-    const key = String(r.nodeId);
+    const key = alias.get(String(r.nodeId)) ?? String(r.nodeId);
     const list = byNode.get(key) ?? [];
     list.push(r);
     byNode.set(key, list);
@@ -402,13 +407,13 @@ teacherRouter.get(
     const profile = await profileOf(uid(req));
     assertTeaches(profile, classLevel);
     const subjects = profile.assignments.find((a) => a.classLevel === classLevel)?.subjects ?? [];
-    const [nodes, lessons] = await Promise.all([
-      CurriculumNode.find({ classLevel, subjectCode: { $in: subjects }, kind: "lesson", status: { $ne: "retired" } })
-        .select("_id subjectCode term")
-        .lean(),
+    const [bySubject, lessons] = await Promise.all([
+      lessonsFor(uid(req), classLevel, subjects),
       LessonInstance.find({ teacherId: uid(req), classLevel }).select("nodeId status date subjectCode").lean(),
     ]);
+    const nodes = [...bySubject.values()].flatMap((v) => v.nodes);
     const statusByNode = new Map<string, string>();
+    for (const n of nodes) if ((n as { alreadyTaught?: boolean }).alreadyTaught) statusByNode.set(String(n._id), "done");
     const lateNodes = new Set<string>();
     for (const l of lessons) {
       const k = String(l.nodeId);
@@ -416,7 +421,7 @@ teacherRouter.get(
       if (l.status === "done" || (l.status === "partial" && prev !== "done") || !prev) statusByNode.set(k, l.status);
       if (l.date < today && l.status === "planned") lateNodes.add(k);
     }
-    const bySubject = subjects.map((subjectCode) => {
+    const summary = subjects.map((subjectCode) => {
       const list = nodes.filter((n) => n.subjectCode === subjectCode);
       const count = (s: string) => list.filter((n) => statusByNode.get(String(n._id)) === s).length;
       const done = count("done");
@@ -437,7 +442,7 @@ teacherRouter.get(
         }),
       };
     });
-    res.json({ classLevel, subjects: bySubject });
+    res.json({ classLevel, subjects: summary });
   })
 );
 
@@ -485,15 +490,14 @@ teacherRouter.get(
     const profile = await profileOf(uid(req));
     assertTeaches(profile, classLevel);
     const subjects = profile.assignments.find((a) => a.classLevel === classLevel)?.subjects ?? [];
-    const [nodes, lessons] = await Promise.all([
-      CurriculumNode.find({ classLevel, subjectCode: { $in: subjects }, kind: "lesson", status: { $ne: "retired" } })
-        .sort({ order: 1 })
-        .select("_id subjectCode title order term")
-        .lean(),
+    const [bySubject, lessons] = await Promise.all([
+      lessonsFor(uid(req), classLevel, subjects),
       LessonInstance.find({ teacherId: uid(req), classLevel }).select("nodeId status").lean(),
     ]);
+    const nodes = [...bySubject.values()].flatMap((v) => v.nodes);
     const rank: Record<string, number> = { done: 4, partial: 3, missed: 2, planned: 1 };
     const best = new Map<string, string>();
+    for (const n of nodes) if ((n as { alreadyTaught?: boolean }).alreadyTaught) best.set(String(n._id), "done");
     for (const l of lessons) {
       const k = String(l.nodeId);
       if ((rank[l.status] ?? 0) > (rank[best.get(k) ?? ""] ?? 0)) best.set(k, l.status);
@@ -501,10 +505,164 @@ teacherRouter.get(
     res.json(
       subjects.map((subjectCode) => ({
         subjectCode,
+        source: bySubject.get(subjectCode)?.source ?? "official",
         lessons: nodes
           .filter((n) => n.subjectCode === subjectCode)
           .map((n) => ({ id: String(n._id), title: n.title, order: n.order, term: n.term ?? null, status: best.get(String(n._id)) ?? "none" })),
       }))
     );
+  })
+);
+
+
+/* ───────────── Ma progression (curriculum personnel) ───────────── */
+
+const classSubject = z.object({ classLevel: z.enum(ALL_CLASS_LEVELS), subjectCode: z.string().max(40) });
+
+teacherRouter.get(
+  "/curriculum",
+  validate(classSubject, "query"),
+  ah(async (req, res) => {
+    const { classLevel, subjectCode } = req.query as { classLevel: string; subjectCode: string };
+    const profile = await profileOf(uid(req));
+    assertTeaches(profile, classLevel);
+    const entry = (await lessonsFor(uid(req), classLevel, [subjectCode])).get(subjectCode)!;
+    res.json({
+      source: entry.source,
+      lessons: entry.nodes.map((n) => ({
+        id: String(n._id),
+        title: n.title,
+        objectives: n.objectives ?? [],
+        order: n.order,
+        term: n.term ?? null,
+        alreadyTaught: Boolean((n as { alreadyTaught?: boolean }).alreadyTaught),
+        hasLibrary: entry.source === "official" || Boolean((n as { matchedNodeId?: unknown }).matchedNodeId),
+      })),
+    });
+  })
+);
+
+/** Aperçu sans enregistrement : l'enseignant vérifie la liste lue avant de valider. */
+teacherRouter.post(
+  "/curriculum/parse",
+  validate(z.object({ text: z.string().min(3).max(60_000) })),
+  ah(async (req, res) => {
+    res.json({ lessons: parseProgression(req.body.text) });
+  })
+);
+
+teacherRouter.put(
+  "/curriculum",
+  validate(
+    classSubject.extend({
+      lessons: z
+        .array(z.object({ title: z.string().trim().min(2).max(200), objectives: z.array(z.string().max(300)).max(10).default([]), term: z.number().int().min(1).max(3).nullable().default(null), week: z.number().int().min(1).max(60).nullable().default(null) }))
+        .min(1)
+        .max(400),
+      startAt: z.number().int().min(0).max(400).default(0),
+      today: localDate,
+    })
+  ),
+  ah(async (req, res) => {
+    const { classLevel, subjectCode, lessons, startAt, today } = req.body;
+    const profile = await profileOf(uid(req));
+    assertTeaches(profile, classLevel);
+    res.json(await saveTeacherCurriculum(uid(req), classLevel, subjectCode, lessons, today, startAt));
+  })
+);
+
+teacherRouter.delete(
+  "/curriculum",
+  validate(classSubject.extend({ today: localDate }), "query"),
+  ah(async (req, res) => {
+    const { classLevel, subjectCode, today } = req.query as { classLevel: string; subjectCode: string; today: string };
+    const profile = await profileOf(uid(req));
+    assertTeaches(profile, classLevel);
+    await resetTeacherCurriculum(uid(req), classLevel, subjectCode, today);
+    res.status(204).end();
+  })
+);
+
+/* ───────────── Mes fiches de préparation ───────────── */
+
+const prepContent = z.object({
+  objectives: z.array(z.string().max(400)).max(12).optional(),
+  materials: z.array(z.string().max(300)).max(20).optional(),
+  steps: z
+    .array(z.object({ name: z.string().max(160), durationMin: z.number().int().min(1).max(120), teacherActivities: z.array(z.string().max(800)).max(15).default([]), learnerActivities: z.array(z.string().max(800)).max(15).default([]) }))
+    .max(12)
+    .optional(),
+  writtenTrace: z.string().max(4000).optional(),
+  exercises: z.array(z.object({ prompt: z.string().min(1).max(2000), answer: z.string().max(2000).default("") })).max(30).optional(),
+  notes: z.string().max(6000).optional(),
+});
+
+async function ownNode(teacherId: string, nodeId: string) {
+  // Une fiche se rattache à une leçon du programme officiel ou de la progression de l'enseignant lui-même.
+  const node = await CurriculumNode.findOne({ _id: nodeId, $or: [{ ownerId: null }, { ownerId: teacherId }] }).lean();
+  if (!node) throw notFound("Leçon introuvable");
+  return node;
+}
+
+teacherRouter.get(
+  "/preps/:nodeId",
+  ah(async (req, res) => {
+    await ownNode(uid(req), String(req.params.nodeId));
+    const prep = await TeacherPrep.findOne({ teacherId: uid(req), nodeId: req.params.nodeId }).lean();
+    res.json(prep ? { content: prep.content, fileName: prep.fileName ?? null, fileUrl: prep.fileUrl ?? null, updatedAt: prep.updatedAt } : null);
+  })
+);
+
+teacherRouter.put(
+  "/preps/:nodeId",
+  validate(z.object({ content: prepContent, fileUrl: z.string().url().refine((u) => /^https:\/\/([a-z0-9-]+\.)*(ufs\.sh|utfs\.io)\//i.test(u), "Fichier non autorisé").optional(), fileName: z.string().max(200).optional() })),
+  ah(async (req, res) => {
+    await ownNode(uid(req), String(req.params.nodeId));
+    const prep = await TeacherPrep.findOneAndUpdate(
+      { teacherId: uid(req), nodeId: req.params.nodeId },
+      { content: req.body.content, ...(req.body.fileUrl ? { fileUrl: req.body.fileUrl, fileName: req.body.fileName } : {}) },
+      { upsert: true, new: true }
+    ).lean();
+    res.json({ content: prep.content, fileName: prep.fileName ?? null, updatedAt: prep.updatedAt });
+  })
+);
+
+teacherRouter.delete(
+  "/preps/:nodeId",
+  ah(async (req, res) => {
+    await TeacherPrep.deleteOne({ teacherId: uid(req), nodeId: req.params.nodeId });
+    res.status(204).end();
+  })
+);
+
+/**
+ * Document de la séance : la fiche de l'enseignant d'abord, complétée par la bibliothèque
+ * (variante la plus proche du niveau et des illustrations choisis), avec l'en-tête de la classe.
+ */
+teacherRouter.post(
+  "/lessons/:lessonId/document",
+  validate(
+    z.object({
+      format: z.enum(["pdf", "docx"]).default("pdf"),
+      difficulty: z.enum(["easy", "standard", "advanced"]).optional(),
+      illustrationLevel: z.enum(["simple", "standard", "detailed"]).optional(),
+      includeAnswers: z.boolean().default(true),
+    })
+  ),
+  ah(async (req, res) => {
+    const lesson = await LessonInstance.findOne({ _id: req.params.lessonId, teacherId: uid(req) }).lean();
+    if (!lesson) throw notFound("Séance introuvable");
+    const [profile, user] = await Promise.all([profileOf(uid(req)), User.findById(uid(req)).lean()]);
+    const out = await buildLessonDocument({
+      teacherId: uid(req),
+      teacherName: user?.fullName ?? "",
+      schoolName: profile.schoolName ?? "",
+      lesson,
+      difficulty: req.body.difficulty ?? profile.preferences?.difficulty ?? "standard",
+      illustrationLevel: req.body.illustrationLevel ?? profile.preferences?.illustrationLevel ?? "simple",
+      includeAnswers: req.body.includeAnswers,
+      format: req.body.format,
+    });
+    res.json(out);
   })
 );

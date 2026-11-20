@@ -1,6 +1,7 @@
 import { Types } from "mongoose";
 import { AcademicCalendar, CatchUpItem, CurriculumNode, LessonInstance, Timetable } from "../models/index.js";
 import { addDays, eachDay, weekday } from "../utils/dates.js";
+import { lessonsFor } from "./curriculum.js";
 
 type Calendar = { startsOn: string; endsOn: string; breaks: { startsOn: string; endsOn: string }[] };
 
@@ -42,12 +43,10 @@ export async function ensurePlan(teacherId: string, classLevel: string, schoolYe
 
   const subjects = [...new Set(timetable.slots.map((s) => s.subjectCode))];
   // 3 requêtes au total, quel que soit le nombre de matières.
-  const [existing, allNodes, plannedRows] = await Promise.all([
+  const [existing, bySubject, plannedRows] = await Promise.all([
     LessonInstance.find({ teacherId, classLevel, date: { $gte: from, $lte: to } }).select("date start").lean(),
-    CurriculumNode.find({ classLevel, subjectCode: { $in: subjects }, kind: "lesson", status: { $ne: "retired" } })
-      .sort({ order: 1 })
-      .select("_id subjectCode")
-      .lean(),
+    // Progression de l'enseignant si elle existe pour la matière, sinon programme officiel.
+    lessonsFor(teacherId, classLevel, subjects),
     // Les leçons déjà attribuées (hors annulées) ne sont pas redistribuées.
     LessonInstance.find({ teacherId, classLevel, origin: "plan", status: { $ne: "cancelled" } }).select("nodeId -_id").lean(),
   ]);
@@ -56,7 +55,7 @@ export async function ensurePlan(teacherId: string, classLevel: string, schoolYe
 
   const cursors = new Map<string, { nodes: { _id: unknown }[]; next: number }>();
   for (const subjectCode of subjects) {
-    const nodes = allNodes.filter((n) => n.subjectCode === subjectCode);
+    const nodes = (bySubject.get(subjectCode)?.nodes ?? []).filter((n) => !(n as { alreadyTaught?: boolean }).alreadyTaught);
     const firstFree = nodes.findIndex((n) => !plannedSet.has(String(n._id)));
     cursors.set(subjectCode, { nodes, next: firstFree === -1 ? nodes.length : firstFree });
   }
