@@ -19,6 +19,8 @@ type ChatInput = {
   maxTokens?: number;
   temperature?: number;
   json?: boolean;
+  /** Greffons OpenRouter (ex. recherche web : [{ id: "web", max_results: 8 }]). */
+  plugins?: { id: string; [k: string]: unknown }[];
 };
 
 /**
@@ -56,6 +58,7 @@ export async function chat(input: ChatInput) {
         max_tokens: input.maxTokens ?? 6000,
         temperature: input.temperature ?? 0.3,
         ...(input.json ? { response_format: { type: "json_object" } } : {}),
+        ...(input.plugins ? { plugins: input.plugins } : {}),
         usage: { include: true },
         provider: { data_collection: "deny", allow_fallbacks: true },
       }),

@@ -108,8 +108,15 @@ test("principe des quatre yeux et publication réservée à l'admin", async () =
   const reviewer = await staffToken("relecteur@pedago.test", "Pedago-Relecteur-2026!");
   const r = await Resource.findOne({ status: "PUBLISHED" });
   const id = String(r!._id);
+  const viewPdf = (token: string) => fetch(`${base}/api/v1/admin/resources/${id}/pdf`, { headers: { Authorization: `Bearer ${token}` } }).then((x) => x.arrayBuffer());
   assert.equal((await call(`/admin/resources/${id}/revise`, { method: "POST", token: reviewer })).status, 403);
   assert.equal((await call(`/admin/resources/${id}/revise`, { method: "POST", token: admin })).status, 200);
+  // Sans avoir affiché le PDF de la nouvelle version, pas de validation.
+  const blind = await call(`/admin/resources/${id}/transition`, { method: "POST", token: reviewer, body: { to: "APPROVED" } });
+  assert.equal(blind.status, 400);
+  assert.equal(blind.body.code, "PDF_NOT_REVIEWED");
+  await viewPdf(reviewer);
+  await viewPdf(admin);
   // L'auteur de la révision ne peut pas l'approuver lui-même.
   const self = await call(`/admin/resources/${id}/transition`, { method: "POST", token: admin, body: { to: "APPROVED" } });
   assert.equal(self.status, 403);
@@ -125,6 +132,67 @@ test("sources : liste blanche, pas d'URL arbitraire ni de javascript:", async ()
   assert.equal((await post({ fileUrl: "http://127.0.0.1:5100/api/v1/health" })).status, 400);
   assert.equal((await post({ url: "javascript:alert(1)" })).status, 400);
   assert.equal((await post({ url: "https://www.minedub.cm/programme.pdf" })).status, 201);
+});
+
+test("sources : dépôt d'un PDF, doublon refusé, fichier relu, recherche filtrée sur les sites officiels", async () => {
+  const admin = await staffToken("admin@pedago.test", "Pedago-Admin-2026!");
+  const PDFDocument = (await import("pdfkit")).default;
+  const pdf = await new Promise<Buffer>((resolve) => {
+    const d = new PDFDocument();
+    const chunks: Buffer[] = [];
+    d.on("data", (c: Buffer) => chunks.push(c));
+    d.on("end", () => resolve(Buffer.concat(chunks)));
+    d.text("PROGRAMME OFFICIEL DE L'ÉCOLE PRIMAIRE — NIVEAU II. ".repeat(12));
+    d.end();
+  });
+  const send = (file: Buffer, title = "Programme officiel niveau II") => {
+    const form = new FormData();
+    form.append("title", title);
+    form.append("issuer", "MINEDUB");
+    form.append("docType", "curriculum");
+    form.append("file", new Blob([new Uint8Array(file)], { type: "application/pdf" }), "programme.pdf");
+    return fetch(`${base}/api/v1/admin/sources/upload`, { method: "POST", headers: { Authorization: `Bearer ${admin}` }, body: form }).then(async (r) => ({ status: r.status, body: (await r.json()) as any }));
+  };
+  const up = await send(pdf);
+  assert.equal(up.status, 201);
+  assert.equal(up.body.status, "extracted");
+  assert.equal(up.body.extractedText, undefined);
+  assert.equal((await send(pdf, "Même fichier")).status, 409);
+  assert.equal((await send(Buffer.from("<html>pas un pdf</html>"))).status, 400);
+  // Le fichier se relit tel quel (aperçu dans l'admin).
+  const file = await fetch(`${base}/api/v1/admin/sources/${up.body._id}/file`, { headers: { Authorization: `Bearer ${admin}` } });
+  assert.equal(file.headers.get("content-type"), "application/pdf");
+  assert.equal(Buffer.from(await file.arrayBuffer()).subarray(0, 5).toString(), "%PDF-");
+
+  // Recherche IA : sans clé, refusée ; les candidats hors liste blanche ne deviennent jamais des sources.
+  const job = await call("/admin/ai/jobs", { method: "POST", token: admin, body: { kind: "research_sources", params: { subsystem: "francophone", classLevel: "CE1" } } });
+  assert.equal(job.status, 400);
+  const { saveResearchCandidates } = await import("../src/ai/pipeline.js");
+  const out = await saveResearchCandidates("test", [
+    { title: "Guide pédagogique CE1", issuer: "MINEDUB", url: "https://www.minedub.cm/guide-ce1.pdf", docType: "guide", reason: "officiel" },
+    { title: "Copie sur un blog", issuer: "Blog", url: "https://blog.example.com/guide.pdf", docType: "guide" },
+    { title: "Guide pédagogique CE1 (doublon)", issuer: "MINEDUB", url: "https://www.minedub.cm/guide-ce1.pdf", docType: "guide" },
+    { title: "x", url: "pas une url" },
+  ]);
+  assert.equal(out.created.length, 1);
+  assert.deepEqual(out.offList, ["blog.example.com"]);
+  assert.equal(out.duplicates, 1);
+  assert.equal(out.invalid, 1);
+});
+
+test("relecture : PDF de la ressource avant validation, mention « À valider », versions passées", async () => {
+  const admin = await staffToken("admin@pedago.test", "Pedago-Admin-2026!");
+  const r = await Resource.findOne({ status: { $ne: "PUBLISHED" } }) ?? (await Resource.findOne());
+  const res = await fetch(`${base}/api/v1/admin/resources/${r!._id}/pdf`, { headers: { Authorization: `Bearer ${admin}` } });
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("content-type"), "application/pdf");
+  const { extractText, getDocumentProxy } = await import("unpdf");
+  const { text } = await extractText(await getDocumentProxy(new Uint8Array(await res.arrayBuffer())), { mergePages: true });
+  if (r!.status !== "PUBLISHED") assert.match(String(text), /À VALIDER/);
+  assert.equal((await fetch(`${base}/api/v1/admin/resources/${r!._id}/pdf?version=999`, { headers: { Authorization: `Bearer ${admin}` } })).status, 404);
+  // Un enseignant n'y a pas accès.
+  const teacher = (await login("enseignant@pedago.test", "Pedago-Enseignant-2026!")).body.accessToken;
+  assert.equal((await fetch(`${base}/api/v1/admin/resources/${r!._id}/pdf`, { headers: { Authorization: `Bearer ${teacher}` } })).status, 403);
 });
 
 test("désactiver un compte ferme ses sessions immédiatement", async () => {

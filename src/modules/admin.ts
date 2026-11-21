@@ -1,4 +1,7 @@
+import crypto from "node:crypto";
 import { Router } from "express";
+import multer from "multer";
+import { extractText, getDocumentProxy } from "unpdf";
 import { z } from "zod";
 import {
   AcademicCalendar,
@@ -26,7 +29,9 @@ import { requireAuth, requireRole, type AuthedRequest } from "../middleware/auth
 import { validate } from "../middleware/validate.js";
 import { ah, badRequest, forbidden, notFound } from "../utils/http-error.js";
 import { lessonContentSchema, deterministicChecks } from "../services/content-schema.js";
-import { buildLibraryParams, extractParams, generateParams, STEPS } from "../ai/pipeline.js";
+import { buildLibraryParams, extractParams, generateParams, researchParams, SOURCE_DOC_TYPES, STEPS } from "../ai/pipeline.js";
+import { reviewPdf } from "../services/exports.js";
+import { readStoredFile, storeFile } from "../services/storage.js";
 import { env } from "../config/env.js";
 import { isAllowedHost, isUploadThingUrl } from "../ai/safe-fetch.js";
 
@@ -129,6 +134,78 @@ adminRouter.patch(
     if (!doc) throw notFound();
     await audit(req, "source.update", String(doc._id), req.body);
     res.json(doc);
+  })
+);
+
+/**
+ * Dépôt direct d'un document officiel (PDF reçu, téléchargé à la main…) : stocké, texte lu sur place.
+ * Un même fichier n'est jamais déposé deux fois (empreinte SHA-256). Il reste « à vérifier » par un humain.
+ */
+const SOURCE_MAX_BYTES = 30 * 1024 * 1024;
+const sourceUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: SOURCE_MAX_BYTES, files: 1, fields: 10 } });
+const uploadMeta = z.object({
+  title: z.string().trim().min(3).max(300),
+  issuer: z.string().trim().min(2).max(160),
+  docType: z.enum(SOURCE_DOC_TYPES).default("other"),
+  usageRights: z.enum(["public_official", "licensed", "reference_only", "unknown"]).default("unknown"),
+  publishedOn: z.string().trim().max(20).optional(),
+  reference: z.string().trim().max(200).optional(),
+  notes: z.string().max(2000).optional(),
+});
+
+adminRouter.post(
+  "/sources/upload",
+  (req, res, next) =>
+    sourceUpload.single("file")(req, res, (err: unknown) => {
+      if (err instanceof multer.MulterError) return next(badRequest(err.code === "LIMIT_FILE_SIZE" ? "FILE_TOO_LARGE" : "UPLOAD_INVALID", err.code === "LIMIT_FILE_SIZE" ? "Fichier trop lourd (30 Mo maximum)" : "Envoi invalide"));
+      next(err);
+    }),
+  ah(async (req, res) => {
+    const file = (req as unknown as { file?: Express.Multer.File }).file;
+    if (!file) throw badRequest("FILE_MISSING", "Aucun fichier reçu");
+    if (file.buffer.subarray(0, 5).toString("latin1") !== "%PDF-") throw badRequest("FILE_TYPE", "Seuls les PDF sont acceptés");
+    const meta = uploadMeta.parse(req.body);
+    const sha256 = crypto.createHash("sha256").update(file.buffer).digest("hex");
+    const dup = await SourceDocument.findOne({ sha256 }).select("_id title").lean();
+    if (dup) return res.status(409).json({ code: "DUPLICATE", message: `Déjà déposé : « ${dup.title} »`, id: String(dup._id) });
+
+    let text = "";
+    let pageCount = 0;
+    try {
+      const pdf = await getDocumentProxy(new Uint8Array(file.buffer));
+      pageCount = pdf.numPages;
+      text = String((await extractText(pdf, { mergePages: true })).text ?? "");
+    } catch {
+      throw badRequest("PDF_UNREADABLE", "Ce PDF ne peut pas être lu (protégé ou abîmé)");
+    }
+    const stored = await storeFile(`source-${crypto.randomBytes(8).toString("hex")}.pdf`, file.buffer, "application/pdf");
+    const doc = await SourceDocument.create({
+      ...meta,
+      fileUrl: stored.url,
+      fileKey: stored.key,
+      sha256,
+      pageCount,
+      // Texte lisible : prêt pour l'extraction ; PDF scanné : l'IA lira les pages à l'extraction.
+      ...(text.trim().length > 200 ? { extractedText: text.slice(0, 400_000), status: "extracted" } : { status: "fetched" }),
+    });
+    await audit(req, "source.upload", String(doc._id), { bytes: file.size, pages: pageCount });
+    res.status(201).json({ ...doc.toObject(), extractedText: undefined, textChars: text.trim().length });
+  })
+);
+
+/** Fichier d'une source (PDF), affiché dans l'admin pour vérification. */
+adminRouter.get(
+  "/sources/:id/file",
+  validate(z.object({ id: objectId }), "params"),
+  ah(async (req, res) => {
+    const src = await SourceDocument.findById(req.params.id).select("title fileUrl").lean();
+    if (!src?.fileUrl) throw notFound("Aucun fichier pour cette source");
+    const data = await readStoredFile(src.fileUrl);
+    if (!data) throw notFound("Fichier illisible");
+    res.setHeader("Content-Type", data.subarray(0, 5).toString("latin1") === "%PDF-" ? "application/pdf" : "application/octet-stream");
+    res.setHeader("Content-Disposition", `inline; filename="source-${src._id}.pdf"`);
+    res.setHeader("Cache-Control", "private, no-store");
+    res.send(data);
   })
 );
 
@@ -250,6 +327,35 @@ adminRouter.get(
   })
 );
 
+/**
+ * PDF d'une ressource tel que les enseignants le recevront (version en cours ou une version passée),
+ * pour relire AVANT de valider ou publier. Mention « À valider » tant qu'elle n'est pas publiée.
+ */
+adminRouter.get(
+  "/resources/:id/pdf",
+  validate(z.object({ id: objectId }), "params"),
+  validate(z.object({ version: z.coerce.number().int().min(1).optional() }), "query"),
+  ah(async (req, res) => {
+    const r = await Resource.findById(req.params.id).lean();
+    if (!r) throw notFound();
+    const version = (req.query as { version?: number }).version;
+    let subject: Parameters<typeof reviewPdf>[0] = r;
+    if (version && version !== r.contentVersion) {
+      const v = await ResourceVersion.findOne({ resourceId: r._id, contentVersion: version }).lean();
+      if (!v) throw notFound("Version introuvable");
+      const snap = v.snapshot as Partial<typeof r>;
+      subject = { ...r, ...snap, contentVersion: version, status: "ARCHIVED" };
+    }
+    const data = await reviewPdf(subject);
+    // Trace de relecture : exigée pour approuver ou publier cette version.
+    await audit(req, "resource.pdf_view", String(r._id), { version: subject.contentVersion });
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="ressource-${r._id}-v${subject.contentVersion}.pdf"`);
+    res.setHeader("Cache-Control", "private, no-store");
+    res.send(data);
+  })
+);
+
 const resourceBody = z.object({
   type: z.enum(RESOURCE_TYPES),
   nodeId: objectId,
@@ -330,6 +436,11 @@ adminRouter.post(
     const from = r.status as ResourceStatus;
     if (!STATUS_TRANSITIONS[from].includes(to)) throw badRequest("BAD_TRANSITION", `Transition ${from} → ${to} interdite`);
     if ((to === "PUBLISHED" || to === "ARCHIVED") && me(req).role !== "admin") throw forbidden("ADMIN_ONLY", "Seul un administrateur publie ou archive");
+    // Valider, c'est avoir vu le document tel qu'il sera diffusé : le PDF de CETTE version, ouvert par CETTE personne.
+    if (to === "APPROVED" || to === "PUBLISHED") {
+      const seen = await AuditLog.exists({ actorId: me(req).userId, action: "resource.pdf_view", target: String(r._id), "meta.version": r.contentVersion });
+      if (!seen) throw badRequest("PDF_NOT_REVIEWED", "Affiche le PDF de la version en cours avant de valider");
+    }
     if (to === "APPROVED") {
       // Principe des quatre yeux : on ne valide pas son propre travail.
       if (r.lastEditedBy && String(r.lastEditedBy) === me(req).userId) {
@@ -390,6 +501,8 @@ const jobSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("build_library"), params: buildLibraryParams, budgetUsd: z.number().min(0).max(1).optional() }),
   z.object({ kind: z.literal("extract_source"), params: extractParams, budgetUsd: z.number().min(0.05).max(20).optional() }),
   z.object({ kind: z.literal("review_resource"), params: z.object({ resourceId: objectId }), budgetUsd: z.number().min(0.05).max(5).optional() }),
+  // Recherche de documents officiels : les candidats trouvés restent « à vérifier » dans Sources.
+  z.object({ kind: z.literal("research_sources"), params: researchParams, budgetUsd: z.number().min(0.05).max(2).optional() }),
 ]);
 
 adminRouter.post(

@@ -42,6 +42,8 @@ type Doc = {
   layout?: PrepLayout | null;
   /** Rubriques propres à l'enseignant, hors rubriques standard (« Domaine », « Prérequis »…). */
   extra?: { label: string; lines: string[] }[];
+  /** Mention imprimée en haut de chaque page (document pas encore validé). */
+  draftNote?: string;
 };
 
 export type Block = { heading: string; lines?: string[]; table?: string[][]; widths?: number[]; images?: PrepImage[] };
@@ -378,6 +380,10 @@ async function renderPdf(d: Doc): Promise<Buffer> {
       // Pied de page dans la marge basse : la marge est levée le temps d'écrire, sinon une page vide est créée.
       pdf.page.margins.bottom = 0;
       pdf.font("Helvetica").fontSize(8).fillColor("#666").text(`PEDAGO — page ${i + 1}/${range.count}`, L, 805, { align: "center", width: W, lineBreak: false });
+      if (d.draftNote) {
+        pdf.page.margins.top = 0;
+        pdf.font("Helvetica-Bold").fontSize(8).fillColor("#B42318").text(d.draftNote, L, 24, { align: "center", width: W, lineBreak: false });
+      }
     }
     pdf.end();
   });
@@ -445,14 +451,11 @@ export function ensureExport(resourceId: string, format: "pdf" | "docx") {
   return p;
 }
 
-async function generateExport(resourceId: string, format: "pdf" | "docx") {
-  const r = await Resource.findById(resourceId);
-  if (!r || r.status !== "PUBLISHED") return null;
-  const existing = r.assets?.[format];
-  if (existing?.url && existing.contentVersion === r.contentVersion) return existing;
+type ResourceLike = { title: string; type: string; classLevel: string; subjectCode: string; difficulty: string; contentVersion: number; content: unknown; sources: { sourceId?: unknown }[]; status?: string };
 
+async function resourceDoc(r: ResourceLike): Promise<Doc> {
   const sources = await SourceDocument.find({ _id: { $in: r.sources.map((s) => s.sourceId) } }).select("title issuer url").lean();
-  const doc: Doc = {
+  return {
     title: r.title,
     type: r.type,
     classLevel: r.classLevel,
@@ -462,6 +465,30 @@ async function generateExport(resourceId: string, format: "pdf" | "docx") {
     content: lessonContentSchema.parse(r.content),
     sources: sources.map((s) => `${s.issuer} — ${s.title}${s.url ? ` (${s.url})` : ""}`),
   };
+}
+
+/**
+ * Relecture : le PDF exact que recevront les enseignants, pour n'importe quel statut (brouillon, en relecture…).
+ * Tant qu'il n'est pas publié, chaque page porte la mention « À valider ».
+ */
+export async function reviewPdf(r: ResourceLike) {
+  const doc = await resourceDoc(r);
+  if (r.status !== "PUBLISHED") doc.draftNote = `À VALIDER — ${r.status ?? "brouillon"} · version ${r.contentVersion} · ne pas diffuser`;
+  return renderPdf(doc);
+}
+
+/** Aperçu (blocs) d'une ressource de la bibliothèque : même rendu que le PDF. */
+export async function resourcePreview(r: ResourceLike) {
+  return previewOf(await resourceDoc(r));
+}
+
+async function generateExport(resourceId: string, format: "pdf" | "docx") {
+  const r = await Resource.findById(resourceId);
+  if (!r || r.status !== "PUBLISHED") return null;
+  const existing = r.assets?.[format];
+  if (existing?.url && existing.contentVersion === r.contentVersion) return existing;
+
+  const doc = await resourceDoc(r);
   const data = format === "pdf" ? await renderPdf(doc) : await renderDocx(doc);
   const slug = r.title.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^\w]+/g, "-").replace(/^-|-$/g, "").slice(0, 60);
   const stored = await storeFile(
