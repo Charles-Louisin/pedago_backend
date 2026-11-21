@@ -40,7 +40,8 @@ export const GeneratedDocument = mongoose.model("GeneratedDocument", generatedDo
 const teacherUploadSchema = new Schema(
   {
     teacherId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
-    kind: { type: String, enum: ["prep", "curriculum"], required: true },
+    // « figure » : image recadrée sur une fiche importée (logo, armoiries, dessin), réutilisée par l'aperçu et le PDF.
+    kind: { type: String, enum: ["prep", "curriculum", "figure"], required: true },
     url: { type: String, required: true },
     key: { type: String, required: true },
     name: { type: String, maxlength: 200 },

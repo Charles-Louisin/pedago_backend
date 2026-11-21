@@ -18,10 +18,22 @@ export const prepStyleSchema = z.object({
   headingUppercase: z.boolean().default(true),
   headingBold: z.boolean().default(false),
   headingUnderline: z.boolean().default(false),
+  /** Intitulés suivis de « : » sur l'original (« Objectif spécifique : »). */
+  headingColon: z.boolean().default(false),
   /** Couleur d'encre des intitulés (#RRGGBB), noir si absente. */
   ink: z.string().regex(/^#[0-9a-f]{6}$/i).nullish(),
 });
 export type PrepStyle = z.infer<typeof prepStyleSchema>;
+
+export const prepImageSchema = z.object({
+  url: z.string().url().max(500),
+  anchor: z.string().trim().max(120).nullish(),
+  position: z.enum(["left", "center", "right"]),
+  widthPct: z.number().min(3).max(100),
+  aspect: z.number().min(0.05).max(20),
+  crop: z.object({ x: z.number().min(0).max(1), y: z.number().min(0).max(1), w: z.number().min(0.01).max(1), h: z.number().min(0.01).max(1) }).nullish(),
+});
+export type PrepImage = z.infer<typeof prepImageSchema>;
 
 export const prepLayoutSchema = z.object({
   title: z.string().trim().max(120).nullish(),
@@ -29,8 +41,12 @@ export const prepLayoutSchema = z.object({
   sections: z.array(z.object({ key: z.enum(SECTION_KEYS), label: z.string().trim().min(1).max(120) })).max(20).optional(),
   stepColumns: z.array(z.object({ key: z.enum(STEP_COLUMNS), label: z.string().trim().min(1).max(60) })).min(2).max(6).optional(),
   style: prepStyleSchema.nullish(),
-  /** Images d'en-tête recadrées sur l'original (logo d'école, armoiries…), avec leur position. */
-  images: z.array(z.object({ url: z.string().url().max(500), position: z.enum(["left", "center", "right"]), widthPct: z.number().min(5).max(60) })).max(3).optional(),
+  /**
+   * Dessins de la fiche d'origine (logo, armoiries, illustrations) : image stockée par l'API, place
+   * (en-tête si `anchor` est vide, sinon après la rubrique de cet intitulé), alignement, largeur en % de
+   * la page, rapport largeur / hauteur. `crop` (0..1) découpe la zone dans la photo d'origine.
+   */
+  images: z.array(prepImageSchema).max(8).optional(),
 });
 export type PrepLayout = z.infer<typeof prepLayoutSchema>;
 export type HeaderField = (typeof HEADER_FIELDS)[number];
@@ -102,6 +118,8 @@ export function parsePrepText(text: string): { content: PrepContent; layout: Pre
     const colon = line.indexOf(":");
     const label = stripBullet(colon > 0 ? line.slice(0, colon) : line).replace(/\s+/g, " ");
     const after = colon > 0 ? line.slice(colon + 1).trim() : "";
+    // Intitulé tel qu'écrit, « : » compris quand il y en a (« Objectif spécifique : »).
+    const asWritten = colon > 0 ? stripBullet(line.slice(0, colon + 1)).replace(/\s+/g, " ") : label;
 
     // Ligne d'en-tête du tableau : plusieurs intitulés de colonnes sur la même ligne.
     const cols = COLUMN_HINTS.filter(([, re]) => re.test(line));
@@ -124,11 +142,11 @@ export function parsePrepText(text: string): { content: PrepContent; layout: Pre
       sectionsStarted = true;
       const formKey = FORM_KEY[s[0]];
       if (formKey) {
-        layout.sections.push({ key: s[0], label });
+        layout.sections.push({ key: s[0], label: asWritten });
         current = { kind: "form", key: formKey };
       } else {
-        layout.sections.push({ key: "extra", label });
-        extra.push({ label, lines: [] });
+        layout.sections.push({ key: "extra", label: asWritten });
+        extra.push({ label: asWritten, lines: [] });
         current = { kind: "extra", index: extra.length - 1 };
       }
       push(after);
@@ -143,8 +161,8 @@ export function parsePrepText(text: string): { content: PrepContent; layout: Pre
     // Intitulé inconnu terminé par « : » (« Méthode : ») = rubrique propre à l'enseignant.
     if (colon === line.length - 1 && label.length <= 40) {
       sectionsStarted = true;
-      layout.sections.push({ key: "extra", label });
-      extra.push({ label, lines: [] });
+      layout.sections.push({ key: "extra", label: asWritten });
+      extra.push({ label: asWritten, lines: [] });
       current = { kind: "extra", index: extra.length - 1 };
       continue;
     }

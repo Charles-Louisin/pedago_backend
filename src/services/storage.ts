@@ -29,6 +29,41 @@ export async function storeFile(name: string, data: Buffer, mime: string): Promi
 
 export const localExportsDir = LOCAL_DIR;
 
+const localBase = () => `${env.publicApiUrl || `http://localhost:${env.port}`}/exports/`;
+const UT_HOST = /^([a-z0-9-]+\.)?ufs\.sh$|^utfs\.io$/i;
+
+/** Vrai si l'adresse désigne un fichier stocké par l'API (dossier local ou UploadThing), et rien d'autre. */
+export function isStoredUrl(url: string) {
+  if (url.startsWith(localBase())) return !url.slice(localBase().length).includes("/");
+  try {
+    const u = new URL(url);
+    return u.protocol === "https:" && UT_HOST.test(u.hostname);
+  } catch {
+    return false;
+  }
+}
+
+const READ_MAX = 8 * 1024 * 1024;
+/**
+ * Relit un fichier stocké (image d'une fiche pour le PDF) : seulement nos propres adresses (pas de
+ * requête vers une adresse choisie par un client), 5 s et 8 Mo au plus, sans redirection.
+ */
+export async function readStoredFile(url: string): Promise<Buffer | null> {
+  if (!isStoredUrl(url)) return null;
+  if (url.startsWith(localBase())) {
+    const data = await fs.readFile(path.join(LOCAL_DIR, path.basename(url.slice(localBase().length)))).catch(() => null);
+    return data && data.length <= READ_MAX ? data : null;
+  }
+  try {
+    const res = await fetch(url, { redirect: "error", signal: AbortSignal.timeout(5000) });
+    if (!res.ok || Number(res.headers.get("content-length") ?? 0) > READ_MAX) return null;
+    const data = Buffer.from(await res.arrayBuffer());
+    return data.length <= READ_MAX ? data : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Efface un fichier stocké (UploadThing ou dossier local). Sans erreur si le fichier n'existe plus. */
 export async function deleteStoredFile(key: string, url: string) {
   if (url.includes("/exports/")) {

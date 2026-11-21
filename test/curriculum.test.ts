@@ -89,7 +89,7 @@ Exercices
   assert.deepEqual(content.steps?.map((x) => [x.name, x.durationMin]), [["Rappel", 5], ["Découverte", 20]]);
   assert.equal(content.writtenTrace, "Pour additionner, je réunis deux quantités.");
   assert.deepEqual(content.exercises, [{ prompt: "3 + 4", answer: "7" }]);
-  assert.deepEqual(content.extra, [{ label: "Méthode", lines: ["Travail en groupes"] }]);
+  assert.deepEqual(content.extra, [{ label: "Méthode :", lines: ["Travail en groupes"] }]);
   assert.deepEqual(layout?.header?.map((h) => [h.label, h.field, h.value ?? null]), [
     ["École", "school", "EP Bastos"],
     ["Classe", "class", "CP"],
@@ -97,7 +97,7 @@ Exercices
     ["Date", "date", null],
     ["Domaine", "other", "Mathématiques"],
   ]);
-  assert.deepEqual(layout?.sections?.map((x) => x.label), ["Objectif spécifique", "Matériel didactique", "Déroulement", "Méthode", "Je retiens", "Exercices"]);
+  assert.deepEqual(layout?.sections?.map((x) => x.label), ["Objectif spécifique :", "Matériel didactique :", "Déroulement", "Méthode :", "Je retiens", "Exercices"]);
   assert.equal(layout?.stepColumns?.length, 4);
 });
 
@@ -193,6 +193,33 @@ async function pdfWith(lines: string[]) {
   return done;
 }
 
+test("apparence d'une fiche PDF : police, titre centré, intitulés, encre, logo et dessin à leur place", async () => {
+  const { encodePng, readFicheLook } = await import("../src/services/fiche-look.js");
+  const px = (w: number, h: number, rgba: [number, number, number, number]) => encodePng(w, h, new Uint8Array(w * h * 4).map((_, i) => rgba[i % 4]));
+  const PDFDocument = (await import("pdfkit")).default;
+  const doc = new PDFDocument({ size: "A4", margin: 56 });
+  const chunks: Buffer[] = [];
+  doc.on("data", (c: Buffer) => chunks.push(c));
+  const done = new Promise<Buffer>((r) => doc.on("end", () => r(Buffer.concat(chunks))));
+  doc.image(px(40, 40, [0, 122, 94, 255]), 56, 40, { width: 60 });
+  doc.font("Times-Bold").fontSize(18).text("FICHE DE PRÉPARATION", 56, 60, { align: "center" });
+  doc.font("Times-Roman").fontSize(11).text("Classe : CP", 56, 130);
+  for (const [h, body] of [["Objectif spécifique :", "Compter jusqu'à 30"], ["Exercices", "Compte les pommes."]]) {
+    doc.moveDown(0.5).font("Times-Bold").fillColor("#1f3a93").text(h, 56, undefined, { underline: true });
+    doc.font("Times-Roman").fillColor("#000").text(body, 56);
+  }
+  doc.image(px(90, 30, [214, 40, 40, 255]), 300, doc.y + 6, { width: 180 });
+  doc.end();
+  const look = await readFicheLook(await done, ["Objectif spécifique :", "Exercices"], "FICHE DE PRÉPARATION");
+  assert.ok(look);
+  assert.deepEqual(look.style, { font: "serif", titleAlign: "center", headingUppercase: false, headingBold: true, headingUnderline: true, headingColon: false, ink: "#1f3a93" });
+  assert.deepEqual(look.figures.map((f) => [f.anchor, f.position, Math.round(f.widthPct), Math.round(f.aspect * 10) / 10]), [
+    [null, "left", 10, 1],
+    ["Exercices", "right", 30, 3],
+  ]);
+  assert.equal(look.figures[0].png.subarray(1, 4).toString(), "PNG");
+});
+
 async function upload(kind: string, data: Buffer, name: string, type: string) {
   const form = new FormData();
   form.append("kind", kind);
@@ -257,7 +284,7 @@ test("fiche au modèle de l'enseignant : mise en page relevée, aperçu et PDF i
   assert.equal(imp.status, 200);
   assert.equal(imp.body.layout.title, "FICHE DE PRÉPARATION");
   assert.deepEqual(imp.body.layout.header.map((h: { label: string }) => h.label), ["École", "Classe", "Effectif", "Date"]);
-  assert.deepEqual(imp.body.layout.sections.map((x: { label: string }) => x.label), ["Objectif spécifique", "Matériel didactique", "Déroulement", "Je retiens"]);
+  assert.deepEqual(imp.body.layout.sections.map((x: { label: string }) => x.label), ["Objectif spécifique :", "Matériel didactique :", "Déroulement", "Je retiens"]);
   assert.deepEqual(imp.body.layout.stepColumns.map((c: { label: string }) => c.label), ["Étapes", "Durée", "Activités du maître", "Activités des élèves"]);
 
   const plan = await call("/teacher/planning?from=2026-11-23&to=2026-11-27");
@@ -267,11 +294,15 @@ test("fiche au modèle de l'enseignant : mise en page relevée, aperçu et PDF i
   // Aperçu : le modèle de l'enseignant (titre, cartouche, rubriques, colonnes), pas celui de PEDAGO.
   const prev = await call(`/teacher/lessons/${lesson.id}/preview`, { method: "POST", body: { difficulty: "standard", includeAnswers: false } });
   assert.equal(prev.status, 200);
-  assert.equal(prev.body.kicker, "FICHE DE PRÉPARATION");
+  // Le titre de la fiche d'origine en grand, la leçon dessous ; l'apparence relevée est transmise.
+  assert.equal(prev.body.title, "FICHE DE PRÉPARATION");
+  assert.equal(prev.body.kicker, null);
+  assert.ok(prev.body.subtitle);
+  assert.equal(prev.body.style.font, "sans");
   assert.deepEqual(prev.body.meta.map((m: [string, string]) => m[0]), ["École", "Classe", "Effectif", "Date"]);
   assert.equal(prev.body.meta[1][1], "CP");
   const headings = prev.body.blocks.map((b: { heading: string }) => b.heading);
-  assert.deepEqual(headings, ["Objectif spécifique", "Matériel didactique", "Déroulement", "Je retiens"]);
+  assert.deepEqual(headings, ["Objectif spécifique :", "Matériel didactique :", "Déroulement", "Je retiens"]);
   assert.deepEqual(prev.body.blocks[2].table[0], ["Étapes", "Durée", "Activités du maître", "Activités des élèves"]);
   assert.equal(prev.body.usedLayout, true);
   assert.equal(prev.body.adaptation, "not_needed");
@@ -294,7 +325,7 @@ test("fiche au modèle de l'enseignant : mise en page relevée, aperçu et PDF i
   // Le modèle devient celui des autres fiches de l'enseignant.
   const other = plan.body.lessons.find((l: { subjectCode: string; node: { id: string } }) => l.subjectCode !== "MATH");
   const prevOther = await call(`/teacher/lessons/${other.id}/preview`, { method: "POST", body: {} });
-  assert.equal(prevOther.body.kicker, "FICHE DE PRÉPARATION");
+  assert.equal(prevOther.body.title, "FICHE DE PRÉPARATION");
 
   // Niveau facile demandé sans IA : rien n'est inventé, l'aperçu le dit.
   const easy = await call(`/teacher/lessons/${lesson.id}/preview`, { method: "POST", body: { difficulty: "easy" } });

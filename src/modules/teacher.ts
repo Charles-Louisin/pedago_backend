@@ -26,6 +26,7 @@ import { applyCatchUp, ensurePlan, proposeCatchUp } from "../services/planning.j
 import { lessonsFor, parseProgression, resetTeacherCurriculum, saveTeacherCurriculum } from "../services/curriculum.js";
 import { buildLessonDocument, composeLessonDoc, previewOf, type ComposeOptions } from "../services/exports.js";
 import { prepLayoutSchema, type PrepLayout } from "../services/layout.js";
+import { isStoredUrl } from "../services/storage.js";
 import { toMe } from "./auth.js";
 
 export const teacherRouter = Router();
@@ -702,13 +703,25 @@ teacherRouter.put(
     await ownNode(uid(req), String(req.params.nodeId));
     const upload = req.body.uploadId ? await TeacherUpload.findOne({ _id: req.body.uploadId, teacherId: uid(req), kind: "prep" }).lean() : null;
     if (req.body.uploadId && !upload) throw notFound("Fichier introuvable");
+    // Dessins de la fiche : seulement des fichiers stockés de l'enseignant lui-même (jamais une adresse libre).
+    let layout = req.body.layout as PrepLayout | null | undefined;
+    if (layout?.images?.length) {
+      const urls = layout.images.map((i) => i.url);
+      const own = new Set((await TeacherUpload.find({ teacherId: uid(req), url: { $in: urls } }).select("url").lean()).map((u) => u.url));
+      const images = layout.images.filter((i) => own.has(i.url) && isStoredUrl(i.url));
+      layout = { ...layout, images: images.length ? images : undefined };
+    }
     const prep = await TeacherPrep.findOneAndUpdate(
       { teacherId: uid(req), nodeId: req.params.nodeId },
-      { content: req.body.content, ...(req.body.layout !== undefined ? { layout: req.body.layout } : {}), ...(upload ? { fileUrl: upload.url, fileName: upload.name ?? "fiche", fileMime: upload.mime } : {}) },
+      { content: req.body.content, ...(layout !== undefined ? { layout } : {}), ...(upload ? { fileUrl: upload.url, fileName: upload.name ?? "fiche", fileMime: upload.mime } : {}) },
       { upsert: true, new: true }
     ).lean();
-    // Le modèle de la dernière fiche importée devient celui de toutes les fiches de l'enseignant.
-    if (req.body.layout) await TeacherProfile.updateOne({ userId: uid(req) }, { prepLayout: req.body.layout });
+    // Le modèle de la dernière fiche importée devient celui de toutes les fiches de l'enseignant :
+    // cartouche, rubriques, style et images d'en-tête (logo) — pas les dessins propres à cette leçon.
+    if (layout) {
+      const headerImages = layout.images?.filter((i) => !i.anchor);
+      await TeacherProfile.updateOne({ userId: uid(req) }, { prepLayout: { ...layout, images: headerImages?.length ? headerImages : undefined } });
+    }
     res.json({ content: prep.content, fileName: prep.fileName ?? null, updatedAt: prep.updatedAt });
   })
 );

@@ -1,13 +1,14 @@
 import PDFDocument from "pdfkit";
 import { AlignmentType, Document, HeadingLevel, Packer, Paragraph, Table, TableCell, TableRow, TextRun, WidthType } from "docx";
 import crypto from "node:crypto";
+import { createRequire } from "node:module";
 import { AdaptedContent, AiJob, CurriculumNode, GeneratedDocument, Resource, SourceDocument, TeacherPrep, CLASS_LABELS, type ClassLevel } from "../models/index.js";
-import type { PrepLayout } from "./layout.js";
+import { prepStyleSchema, type PrepImage, type PrepLayout, type PrepStyle } from "./layout.js";
 import { chat } from "../ai/openrouter.js";
 import { env } from "../config/env.js";
 import { z } from "zod";
 import { lessonContentSchema, type LessonContent } from "./content-schema.js";
-import { storeFile } from "./storage.js";
+import { readStoredFile, storeFile } from "./storage.js";
 
 const TYPE_LABELS: Record<string, string> = {
   lesson_plan: "Fiche de préparation",
@@ -43,7 +44,7 @@ type Doc = {
   extra?: { label: string; lines: string[] }[];
 };
 
-export type Block = { heading: string; lines?: string[]; table?: string[][]; widths?: number[] };
+export type Block = { heading: string; lines?: string[]; table?: string[][]; widths?: number[]; images?: PrepImage[] };
 
 const TABLE_W = 483;
 const COLUMN_LABELS: Record<string, string> = { name: "Étape", durationMin: "Durée", teacherActivities: "Activités de l'enseignant", learnerActivities: "Activités des apprenants", observations: "Observations" };
@@ -165,8 +166,98 @@ function sections(d: Doc): Block[] {
   return out;
 }
 
-/** PDF A4 imprimable en noir et blanc, économe en encre (pas d'aplats de couleur). */
-function renderPdf(d: Doc): Promise<Buffer> {
+/* ───────── Apparence : celle de la fiche de l'enseignant, sinon la présentation PEDAGO ───────── */
+
+const require_ = createRequire(import.meta.url);
+/** Police manuscrite (Caveat, licence OFL) pour les fiches écrites à la main. */
+const SCRIPT_FONTS = (() => {
+  try {
+    return { regular: require_.resolve("@fontsource/caveat/files/caveat-latin-400-normal.woff2"), bold: require_.resolve("@fontsource/caveat/files/caveat-latin-700-normal.woff2") };
+  } catch {
+    return null;
+  }
+})();
+
+const FAMILIES: Record<PrepStyle["font"], { regular: string; bold: string; scale: number }> = {
+  sans: { regular: "Helvetica", bold: "Helvetica-Bold", scale: 1 },
+  serif: { regular: "Times-Roman", bold: "Times-Bold", scale: 1.06 },
+  mono: { regular: "Courier", bold: "Courier-Bold", scale: 0.95 },
+  // Caveat est plus petite à corps égal : on la grossit pour garder la même lisibilité.
+  script: { regular: "PedagoScript", bold: "PedagoScript-Bold", scale: 1.3 },
+};
+
+/** Style effectif : celui relevé sur la fiche, complété par les valeurs par défaut. */
+export function styleOf(d: Doc): PrepStyle {
+  return prepStyleSchema.parse(d.layout?.style ?? {});
+}
+
+/** Intitulé tel qu'écrit sur l'original : majuscules et « : » final s'il y en avait. */
+export function headingText(h: string, st: PrepStyle) {
+  const t = st.headingUppercase ? h.toUpperCase() : h;
+  return st.headingColon && !/[:?]$/.test(t) ? `${t} :` : t;
+}
+
+/** Titre : le titre de la fiche d'origine (« FICHE DE PRÉPARATION ») en grand, la leçon dessous. */
+export function headOf(d: Doc) {
+  const own = d.layout?.title?.trim();
+  return own
+    ? { kicker: null as string | null, title: own, subtitle: d.title }
+    : { kicker: (TYPE_LABELS[d.type] || d.type).toUpperCase(), title: d.title, subtitle: null as string | null };
+}
+
+const headerImages = (d: Doc) => (d.layout?.images ?? []).filter((i) => !i.anchor);
+
+/** Rubriques + dessins rattachés à leur rubrique (ceux d'une rubrique absente vont à la fin). */
+export function blocksOf(d: Doc): Block[] {
+  const blocks = sections(d);
+  const anchored = (d.layout?.images ?? []).filter((i) => i.anchor);
+  if (!anchored.length || !blocks.length) return blocks;
+  const byLabel = new Map(blocks.map((b, i) => [b.heading.toLowerCase(), i]));
+  for (const img of anchored) {
+    const i = byLabel.get(img.anchor!.toLowerCase()) ?? blocks.length - 1;
+    blocks[i] = { ...blocks[i], images: [...(blocks[i].images ?? []), img] };
+  }
+  return blocks;
+}
+
+/** Charge les images de la fiche (nos fichiers seulement) ; une image illisible est simplement omise. */
+async function loadImages(d: Doc) {
+  const urls = [...new Set((d.layout?.images ?? []).map((i) => i.url))];
+  const out = new Map<string, Buffer>();
+  await Promise.all(
+    urls.map(async (u) => {
+      const b = await readStoredFile(u);
+      // PDFKit lit le PNG et le JPEG.
+      if (b && (b[0] === 0x89 || (b[0] === 0xff && b[1] === 0xd8))) out.set(u, b);
+    })
+  );
+  return out;
+}
+
+const PAGE_W = 595.28;
+const L = 56;
+const W = 483;
+
+/** Dessine une image (ou la découpe d'une photo) à sa place ; renvoie sa hauteur. */
+function drawImage(pdf: PDFKit.PDFDocument, img: PrepImage, buf: Buffer | undefined, y: number) {
+  if (!buf) return 0;
+  const w = Math.min(W, (img.widthPct / 100) * PAGE_W);
+  const h = w / img.aspect;
+  const x = img.position === "left" ? L : img.position === "right" ? L + W - w : L + (W - w) / 2;
+  if (img.crop) {
+    const fw = w / img.crop.w;
+    const fh = h / img.crop.h;
+    pdf.save().rect(x, y, w, h).clip();
+    pdf.image(buf, x - img.crop.x * fw, y - img.crop.y * fh, { width: fw, height: fh });
+    pdf.restore();
+  } else pdf.image(buf, x, y, { width: w, height: h });
+  return h;
+}
+
+/** PDF A4 imprimable, dans l'apparence de la fiche de l'enseignant quand elle est connue. */
+async function renderPdf(d: Doc): Promise<Buffer> {
+  const images = await loadImages(d);
+  const st = styleOf(d);
   return new Promise((resolve, reject) => {
     const pdf = new PDFDocument({ size: "A4", bufferPages: true, margins: { top: 56, bottom: 56, left: 56, right: 56 }, info: { Title: d.title, Producer: "PEDAGO" } });
     const chunks: Buffer[] = [];
@@ -174,59 +265,111 @@ function renderPdf(d: Doc): Promise<Buffer> {
     pdf.on("end", () => resolve(Buffer.concat(chunks)));
     pdf.on("error", reject);
 
-    const L = 56;
-    const W = 483;
-    pdf.font("Helvetica").fontSize(9).fillColor("#555").text((d.layout?.title || TYPE_LABELS[d.type] || d.type).toUpperCase(), { characterSpacing: 1 });
-    pdf.moveDown(0.3).font("Helvetica-Bold").fontSize(17).fillColor("#000").text(d.title);
-    pdf.font("Helvetica");
-    // En-tête de fiche : cadre à deux colonnes, comme une fiche de préparation papier.
+    let fam = FAMILIES[st.font];
+    if (st.font === "script") {
+      if (SCRIPT_FONTS) {
+        pdf.registerFont("PedagoScript", SCRIPT_FONTS.regular);
+        pdf.registerFont("PedagoScript-Bold", SCRIPT_FONTS.bold);
+      } else fam = FAMILIES.sans;
+    }
+    const size = (n: number) => n * fam.scale;
+    const ink = st.ink ?? "#000000";
+    const head = headOf(d);
+    const align = st.titleAlign === "center" ? "center" : "left";
+
+    // En-tête : images (logo, armoiries) à leur place, titre centré entre elles s'il l'est sur l'original.
+    const hdr = headerImages(d).filter((i) => images.has(i.url));
+    let top = 56;
+    let band = 0;
+    for (const img of hdr) band = Math.max(band, drawImage(pdf, img, images.get(img.url), top));
+    const sideOnly = hdr.length > 0 && !hdr.some((i) => i.position === "center");
+    let tx = L;
+    let tw = W;
+    if (sideOnly) {
+      const lw = Math.max(0, ...hdr.filter((i) => i.position === "left").map((i) => Math.min(W, (i.widthPct / 100) * PAGE_W)));
+      const rw = Math.max(0, ...hdr.filter((i) => i.position === "right").map((i) => Math.min(W, (i.widthPct / 100) * PAGE_W)));
+      const side = align === "center" ? Math.max(lw, rw) : 0;
+      tx = L + (align === "center" ? side : lw) + (lw || side ? 10 : 0);
+      tw = W - (tx - L) - (align === "center" ? side : rw) - (rw || side ? 10 : 0);
+    }
+    if (head.kicker) {
+      pdf.font(fam.regular).fontSize(size(9)).fillColor("#555").text(head.kicker, tx, top, { characterSpacing: 1, width: tw, align });
+      pdf.moveDown(0.3);
+    }
+    const titleH = (() => {
+      pdf.font(fam.bold).fontSize(size(head.kicker ? 17 : 18));
+      return pdf.heightOfString(head.title, { width: tw });
+    })();
+    const titleY = sideOnly ? Math.max(head.kicker ? pdf.y : top, top + Math.max(0, (band - titleH) / 2)) : hdr.length ? top + band + 8 : head.kicker ? pdf.y : top;
+    pdf.fillColor("#000").text(head.title, tx, titleY, { width: tw, align });
+    if (head.subtitle) pdf.moveDown(0.2).font(fam.regular).fontSize(size(12.5)).text(head.subtitle, tx, undefined, { width: tw, align });
+    pdf.font(fam.regular);
+    top = Math.max(pdf.y, sideOnly ? top + band : 0);
+
+    // Cartouche : cadre à deux colonnes, comme une fiche de préparation papier.
     const meta = d.meta ?? [
       ["Classe", CLASS_LABELS[d.classLevel as ClassLevel] ?? d.classLevel],
       ["Durée", d.content.generalInfo?.durationMin ? `${d.content.generalInfo.durationMin} min` : "—"],
     ];
     const rows = Math.ceil(meta.length / 2);
-    const top = pdf.y + 10;
+    const mt = top + 10;
     const rowH = 20;
-    pdf.lineWidth(0.6).strokeColor("#888").rect(L, top, W, rows * rowH).stroke();
+    pdf.lineWidth(0.6).strokeColor("#888").rect(L, mt, W, rows * rowH).stroke();
     meta.forEach(([k, v], i) => {
       const col = i % 2;
       const row = Math.floor(i / 2);
       const x = L + col * (W / 2);
-      const y = top + row * rowH;
+      const y = mt + row * rowH;
       if (row > 0 && col === 0) pdf.moveTo(L, y).lineTo(L + W, y).stroke();
-      pdf.fontSize(8.5).fillColor("#555").text(`${k} :`, x + 6, y + 6, { width: 70, lineBreak: false });
-      pdf.fontSize(9.5).fillColor("#000").text(v || "—", x + 74, y + 5.5, { width: W / 2 - 80, height: rowH - 4, ellipsis: true, lineBreak: false });
+      pdf.font(fam.regular).fontSize(size(8.5)).fillColor("#555").text(`${k} :`, x + 6, y + 6, { width: 70, lineBreak: false });
+      pdf.fontSize(size(9.5)).fillColor("#000").text(v || "—", x + 74, y + 5.5, { width: W / 2 - 80, height: rowH - 4, ellipsis: true, lineBreak: false });
     });
-    if (meta.length > 1) pdf.moveTo(L + W / 2, top).lineTo(L + W / 2, top + rows * rowH).stroke();
+    if (meta.length > 1) pdf.moveTo(L + W / 2, mt).lineTo(L + W / 2, mt + rows * rowH).stroke();
     pdf.x = L;
-    pdf.y = top + rows * rowH + 18;
+    pdf.y = mt + rows * rowH + 18;
 
-    for (const s of sections(d)) {
+    for (const s of blocksOf(d)) {
       // Pas de titre seul en bas de page : il part avec son contenu.
       if (pdf.y > 700) pdf.addPage();
-      pdf.fontSize(12).fillColor("#000").text(s.heading.toUpperCase(), { characterSpacing: 0.6 });
-      pdf.moveDown(0.3).fontSize(10.5);
-      for (const line of s.lines ?? []) pdf.text(line, { paragraphGap: 2 });
+      const heading = headingText(s.heading, st);
+      pdf
+        .font(st.headingBold ? fam.bold : fam.regular)
+        .fontSize(size(12))
+        .fillColor(ink)
+        .text(heading, L, undefined, { characterSpacing: st.headingUppercase ? 0.6 : 0, underline: st.headingUnderline, width: W });
+      pdf.fillColor("#000").font(fam.regular);
+      pdf.moveDown(0.3).fontSize(size(10.5));
+      for (const line of s.lines ?? []) pdf.text(line, L, undefined, { paragraphGap: 2, width: W });
       if (s.table) {
         // Tableau à colonnes avec retour à la ligne et saut de page propre.
         const widths = s.widths ?? columnWidths(DEFAULT_COLUMNS.map((x) => x.key));
         for (const [i, row] of s.table.entries()) {
-          pdf.font(i === 0 ? "Helvetica-Bold" : "Helvetica").fontSize(9);
+          pdf.font(i === 0 ? fam.bold : fam.regular).fontSize(size(9));
           const h = Math.max(...row.map((cell, c) => pdf.heightOfString(cell || " ", { width: widths[c] - 8 }))) + 8;
           if (pdf.y + h > 780) pdf.addPage();
           const y = pdf.y;
-          let x = 56;
+          let x = L;
           row.forEach((cell, c) => {
             if (i === 0) pdf.rect(x, y, widths[c], h).fillAndStroke("#EEEEEE", "#888").fillColor("#000");
             else pdf.rect(x, y, widths[c], h).stroke("#888");
             pdf.text(cell, x + 4, y + 4, { width: widths[c] - 8 });
             x += widths[c];
           });
-          pdf.x = 56;
+          pdf.x = L;
           pdf.y = y + h;
         }
-        pdf.font("Helvetica").fontSize(10.5);
+        pdf.font(fam.regular).fontSize(size(10.5));
       }
+      // Dessins de la rubrique, à leur place (gauche, centre, droite), sans couper une image en bas de page.
+      for (const img of s.images ?? []) {
+        const buf = images.get(img.url);
+        if (!buf) continue;
+        const h = Math.min(W, (img.widthPct / 100) * PAGE_W) / img.aspect;
+        if (pdf.y + h + 6 > 780) pdf.addPage();
+        const y = pdf.y + 6;
+        pdf.y = y + drawImage(pdf, img, buf, y);
+      }
+      pdf.x = L;
       pdf.moveDown(0.8);
     }
     const range = pdf.bufferedPageRange();
@@ -234,7 +377,7 @@ function renderPdf(d: Doc): Promise<Buffer> {
       pdf.switchToPage(i);
       // Pied de page dans la marge basse : la marge est levée le temps d'écrire, sinon une page vide est créée.
       pdf.page.margins.bottom = 0;
-      pdf.fontSize(8).fillColor("#666").text(`PEDAGO — page ${i + 1}/${range.count}`, 56, 805, { align: "center", width: 483, lineBreak: false });
+      pdf.font("Helvetica").fontSize(8).fillColor("#666").text(`PEDAGO — page ${i + 1}/${range.count}`, L, 805, { align: "center", width: W, lineBreak: false });
     }
     pdf.end();
   });
@@ -539,7 +682,8 @@ export async function composeLessonDoc(o: ComposeOptions) {
 
 /** Aperçu : exactement les blocs que le PDF dessinera (même titre, même en-tête, mêmes rubriques). */
 export function previewOf(doc: Doc) {
-  return { kicker: (doc.layout?.title || TYPE_LABELS[doc.type] || doc.type).toUpperCase(), title: doc.title, meta: doc.meta ?? [], blocks: sections(doc) };
+  const head = headOf(doc);
+  return { ...head, meta: doc.meta ?? [], blocks: blocksOf(doc), style: styleOf(doc), images: headerImages(doc) };
 }
 
 export async function buildLessonDocument(o: ComposeOptions & { format: "pdf" | "docx" }) {

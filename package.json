@@ -18,6 +18,7 @@
     "load-test": "tsx scripts/load-test.ts"
   },
   "dependencies": {
+    "@fontsource/caveat": "^5.3.0",
     "@node-rs/argon2": "^2.2.2",
     "bcryptjs": "^3.0.2",
     "compression": "^1.8.0",
