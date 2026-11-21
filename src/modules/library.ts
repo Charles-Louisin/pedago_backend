@@ -4,7 +4,7 @@ import { ALL_CLASS_LEVELS, CurriculumNode, DIFFICULTIES, LessonInstance, RESOURC
 import { requireAuth, requireVerifiedEmail, type AuthedRequest } from "../middleware/auth.js";
 import { validate } from "../middleware/validate.js";
 import { ah, badRequest, notFound } from "../utils/http-error.js";
-import { ensureExport } from "../services/exports.js";
+import { ensureExport, resourcePreview } from "../services/exports.js";
 import { isLocalDate } from "../utils/dates.js";
 import { getCalendar } from "../services/planning.js";
 
@@ -46,6 +46,21 @@ libraryRouter.get(
 );
 
 /** Ressource complète, avec traçabilité (sources, pages, version, validation humaine). */
+/**
+ * Aperçu d'une ressource publiée : exactement les blocs que son PDF dessine (titre, cartouche, rubriques,
+ * tableau), pour la voir « comme sur papier » dans l'app avant de la télécharger.
+ */
+libraryRouter.get(
+  "/resources/:id/preview",
+  ah(async (req, res) => {
+    const r = await Resource.findOne({ _id: req.params.id, status: "PUBLISHED" }).lean();
+    if (!r) throw notFound("Ressource introuvable");
+    res.set({ ETag: `W/"p-${r._id}-${r.contentVersion}"`, "Cache-Control": "private, no-cache" });
+    if (req.fresh) return res.status(304).end();
+    res.json({ ...(await resourcePreview(r)), contentVersion: r.contentVersion });
+  })
+);
+
 libraryRouter.get(
   "/resources/:id",
   ah(async (req, res) => {
