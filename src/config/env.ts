@@ -19,8 +19,10 @@ function bool(name: string, fallback: boolean) {
 
 export const env = {
   nodeEnv,
-  port: num("PORT", 5100),
+  port: num("PORT", 5000),
   mongoUri: str("MONGODB_URI", "mongodb://127.0.0.1:27017/pedago"),
+  /** Base utilisée quand l'adresse n'en nomme pas (Atlas donne souvent « …mongodb.net/?… » : sinon ce serait « test »). */
+  mongoDb: str("MONGODB_DB", "pedago"),
   /** Démarre une base MongoDB en mémoire si aucune base n'est joignable (développement uniquement). */
   mongoMemoryFallback: !isProduction && bool("MONGO_MEMORY_FALLBACK", true),
   jwtSecret: str("JWT_SECRET", "change-me-pedago-jwt-secret"),
@@ -28,7 +30,7 @@ export const env = {
   refreshTokenTtlDays: num("REFRESH_TOKEN_TTL_DAYS", 30),
   /** Double authentification obligatoire pour l'équipe (toujours active en production). */
   staffMfaRequired: isProduction || bool("STAFF_MFA_REQUIRED", true),
-  corsOrigin: str("CORS_ORIGIN", "http://localhost:3100"),
+  corsOrigin: str("CORS_ORIGIN", "http://localhost:3000"),
   publicApiUrl: str("PUBLIC_API_URL").replace(/\/$/, ""),
   rateLimitMax: num("RATE_LIMIT_MAX", isProduction ? 400 : 3000),
   rateLimitWindowMs: num("RATE_LIMIT_WINDOW_MS", 60_000),

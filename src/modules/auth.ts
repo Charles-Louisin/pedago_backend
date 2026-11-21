@@ -9,6 +9,7 @@ import { ah, badRequest, conflict, unauthorized, HttpError } from "../utils/http
 import { hashToken, newRefreshToken, signAccessToken, signMfaChallenge, verifyMfaChallenge, type Role } from "../utils/jwt.js";
 import { decryptSecret, encryptSecret, newRecoveryCodes, newTotpSecret, normalizeRecovery, otpauthUrl, verifyTotp } from "../utils/totp.js";
 import { env } from "../config/env.js";
+import { logger } from "../utils/logger.js";
 import { deleteAccount } from "../services/account.js";
 import { burnVerify, hashPassword, needsRehash, verifyPassword } from "../utils/password.js";
 
@@ -75,10 +76,13 @@ export function toMe(user: any, profile: any) {
 const CODE_TTL_MS = 15 * 60_000;
 const CODE_MAX_ATTEMPTS = 5;
 
-/** Génère un code à 6 chiffres (stocké haché), l'envoie par e-mail ; renvoie le code (pour l'écho en développement). */
-async function sendVerificationCode(userId: string) {
+/**
+ * Génère un code à 6 chiffres (stocké haché) et l'envoie par e-mail. Renvoie le code (écho en développement)
+ * et si l'envoi a réussi : un service d'e-mail en panne ne doit pas faire échouer l'inscription.
+ */
+async function sendVerificationCode(userId: string): Promise<{ code: string | null; sent: boolean }> {
   const user = await User.findById(userId).select("+emailCodeSentAt");
-  if (!user?.email || user.emailVerified) return null;
+  if (!user?.email || user.emailVerified) return { code: null, sent: false };
   if (user.emailCodeSentAt && Date.now() - user.emailCodeSentAt.getTime() < 45_000) {
     throw new HttpError(429, "CODE_TOO_SOON", "Patiente quelques secondes avant de redemander un code");
   }
@@ -89,8 +93,13 @@ async function sendVerificationCode(userId: string) {
   user.emailCodeSentAt = new Date();
   await user.save();
   const mail = verificationEmail(user.fullName, code);
-  await sendMail(user.email, mail.subject, mail.html, mail.text);
-  return code;
+  try {
+    await sendMail(user.email, mail.subject, mail.html, mail.text);
+    return { code, sent: true };
+  } catch (err) {
+    logger.warn({ err: (err as Error).message, userId }, "Code de vérification non envoyé");
+    return { code, sent: false };
+  }
 }
 
 authRouter.post(
@@ -127,8 +136,9 @@ authRouter.post(
   "/resend-code",
   requireAuth,
   ah(async (req, res) => {
-    const code = await sendVerificationCode((req as AuthedRequest).userId);
-    res.json({ sent: Boolean(code), ...(env.devEchoCodes && code ? { devCode: code } : {}) });
+    const { code, sent } = await sendVerificationCode((req as AuthedRequest).userId);
+    if (code && !sent && !env.devEchoCodes) throw new HttpError(502, "MAIL_FAILED", "Le code n'a pas pu être envoyé. Vérifie ton adresse ou réessaie dans un instant.");
+    res.json({ sent, ...(env.devEchoCodes && code ? { devCode: code } : {}) });
   })
 );
 
@@ -140,9 +150,10 @@ authRouter.post(
     const exists = await User.exists({ $or: [email ? { email } : null, phone ? { phone } : null].filter(Boolean) as object[] });
     if (exists) throw conflict("ACCOUNT_EXISTS", "Un compte existe déjà avec cet identifiant");
     const user = await User.create({ fullName, email, phone, passwordHash: await hashPassword(password), role: "teacher" });
-    const code = await sendVerificationCode(String(user._id));
+    // Le compte existe et la personne est connectée même si l'e-mail n'est pas parti : elle redemande le code.
+    const { code, sent } = await sendVerificationCode(String(user._id));
     const tokens = await issueSession(user, device);
-    res.status(201).json({ ...tokens, user: toMe(user, null), ...(env.devEchoCodes && code ? { devCode: code } : {}) });
+    res.status(201).json({ ...tokens, user: toMe(user, null), mailSent: sent, ...(env.devEchoCodes && code ? { devCode: code } : {}) });
   })
 );
 

@@ -35,11 +35,15 @@ export const prepImageSchema = z.object({
 });
 export type PrepImage = z.infer<typeof prepImageSchema>;
 
+export const headerItemSchema = z.object({ label: z.string().trim().min(1).max(60), field: z.enum(HEADER_FIELDS), value: z.string().trim().max(120).nullish() });
+export const sectionItemSchema = z.object({ key: z.enum(SECTION_KEYS), label: z.string().trim().min(1).max(120) });
+export const columnItemSchema = z.object({ key: z.enum(STEP_COLUMNS), label: z.string().trim().min(1).max(60) });
+
 export const prepLayoutSchema = z.object({
   title: z.string().trim().max(120).nullish(),
-  header: z.array(z.object({ label: z.string().trim().min(1).max(60), field: z.enum(HEADER_FIELDS), value: z.string().trim().max(120).nullish() })).max(16).optional(),
-  sections: z.array(z.object({ key: z.enum(SECTION_KEYS), label: z.string().trim().min(1).max(120) })).max(20).optional(),
-  stepColumns: z.array(z.object({ key: z.enum(STEP_COLUMNS), label: z.string().trim().min(1).max(60) })).min(2).max(6).optional(),
+  header: z.array(headerItemSchema).max(16).optional(),
+  sections: z.array(sectionItemSchema).max(20).optional(),
+  stepColumns: z.array(columnItemSchema).min(2).max(6).optional(),
   style: prepStyleSchema.nullish(),
   /**
    * Dessins de la fiche d'origine (logo, armoiries, illustrations) : image stockée par l'API, place
@@ -174,6 +178,30 @@ export function parsePrepText(text: string): { content: PrepContent; layout: Pre
   if (extras.length) content.extra = extras;
   const parsed = prepLayoutSchema.safeParse({ ...layout, header: layout.header.length ? layout.header : undefined });
   return { content, layout: layout.sections.length || layout.header.length ? (parsed.success ? parsed.data : null) : null };
+}
+
+/**
+ * Modèle rendu par l'IA, lu avec indulgence : chaque partie est gardée si elle est valide, même quand une
+ * autre ne l'est pas (une fiche sans tableau a des colonnes vides : ce n'est pas une raison de tout perdre).
+ */
+export function lenientLayout(raw: unknown): PrepLayout | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const list = <T>(schema: z.ZodType<T>, v: unknown, max: number) => (Array.isArray(v) ? v.map((x) => schema.safeParse(x)).flatMap((p) => (p.success ? [p.data] : [])).slice(0, max) : []);
+  // Le cartouche s'affiche « Libellé : valeur » : le « : » recopié de l'original est retiré du libellé.
+  const header = list(headerItemSchema, r.header, 16).map((h) => ({ ...h, label: h.label.replace(/\s*:\s*$/, "") || h.label }));
+  const sections = list(sectionItemSchema, r.sections, 20);
+  const stepColumns = list(columnItemSchema, r.stepColumns, 6);
+  const title = z.string().trim().max(120).safeParse(r.title);
+  const style = prepStyleSchema.safeParse(r.style);
+  const out: PrepLayout = {
+    title: title.success ? title.data : null,
+    ...(header.length ? { header } : {}),
+    ...(sections.length ? { sections } : {}),
+    ...(stepColumns.length >= 2 ? { stepColumns } : {}),
+    style: style.success ? style.data : null,
+  };
+  return out.title || header.length || sections.length || out.style ? out : null;
 }
 
 /** Compatibilité : modèle seul. */

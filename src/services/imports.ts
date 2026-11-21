@@ -7,7 +7,7 @@ import { AiNotConfiguredError, BudgetExceededError, chat, type ChatMessage } fro
 import { HttpError } from "../utils/http-error.js";
 import { parseProgression } from "./curriculum.js";
 import type { PrepContent } from "./prep-text.js";
-import { parsePrepText, prepLayoutSchema, prepStyleSchema, type PrepImage, type PrepLayout } from "./layout.js";
+import { lenientLayout, parsePrepText, prepLayoutSchema, SECTION_KEYS, type PrepImage, type PrepLayout } from "./layout.js";
 import { imageSize, readFicheLook } from "./fiche-look.js";
 import { storeFile } from "./storage.js";
 
@@ -23,7 +23,7 @@ import { storeFile } from "./storage.js";
  */
 export const IMPORT_MAX_BYTES = 10 * 1024 * 1024;
 export type ImportKind = "curriculum" | "prep";
-const PROMPT_VERSION = "teacher-import-v2";
+const PROMPT_VERSION = "teacher-import-v3";
 const IMPORT_BUDGET_USD = 0.15;
 
 export function sniffMime(buf: Buffer): "application/pdf" | "image/jpeg" | "image/png" | "image/webp" | null {
@@ -84,16 +84,17 @@ content (rubriques présentes seulement) :
 {"objectives":string[],"materials":string[],"steps":[{"name":string,"durationMin":number,"teacherActivities":string[],"learnerActivities":string[]}],"writtenTrace":string,"exercises":[{"prompt":string,"answer":string}],"notes":string,"extra":[{"label":string,"lines":string[]}]}
 layout (fidèle au document, dans SON ordre et avec SES intitulés exacts) :
 {"title":string|null,
- "header":[{"label":string,"field":"teacher|school|class|subject|date|time|duration|lesson|level|effectif|other"}],
+ "header":[{"label":string,"field":"teacher|school|class|subject|date|time|duration|lesson|level|effectif|other","value":string|null}],
  "sections":[{"key":"competency|objectives|prerequisites|materials|steps|writtenTrace|exercises|assessment|notes|extra","label":string}],
  "stepColumns":[{"key":"name|durationMin|teacherActivities|learnerActivities|observations","label":string}],
  "style":{"font":"sans|serif|script|mono","titleAlign":"left|center","headingUppercase":boolean,"headingBold":boolean,"headingUnderline":boolean,"headingColon":boolean,"ink":"#RRGGBB"|null},
  "figures":[{"box":{"x":number,"y":number,"w":number,"h":number},"anchor":string|null}]}
-Règles : recopie le contenu sans le réécrire ni l'enrichir ; une idée par élément de liste ; durée en minutes (10 si absente) ;
+Règles : recopie le contenu sans le réécrire ni l'enrichir ; une idée par élément de liste ; durée en minutes (10 si absente) ; dans une étape écrite « 1. Rappel (5 min) : compter de 2 en 2 », le nom est « Rappel » et le texte qui suit va dans teacherActivities (ou learnerActivities s'il décrit ce que font les élèves) ;
 une rubrique qui n'a pas d'équivalent (ex. « Domaine », « Sous-domaine », « Méthode ») a la clé "extra" et son contenu va dans content.extra avec le même label ;
-"header" reprend les champs du cartouche (École, Classe, Effectif, Date, Durée…) même vides ; "stepColumns" reprend les colonnes du tableau de déroulement s'il existe ;
+"header" reprend les champs du cartouche (École, Classe, Effectif, Date, Domaine, Durée…) même vides, avec la valeur écrite ("value", null si rien) ;
+les "label" (cartouche, rubriques, colonnes) sont recopiés EXACTEMENT comme écrits, « : » final compris s'il y en a ; "stepColumns" reprend les colonnes du tableau de déroulement s'il existe ;
 "style" décrit l'écriture : "script" pour une fiche manuscrite, "serif" pour une police à empattements (Times…), "ink" = couleur des intitulés si elle n'est pas noire ;
-"figures" (photo seulement) : chaque dessin, logo ou armoiries, cadre en fractions de l'image (0 à 1, x/y = coin haut gauche), "anchor" = intitulé de la rubrique où il se trouve, null s'il est dans l'en-tête.`,
+"figures" (photo seulement) : chaque dessin, logo ou armoiries, cadre en fractions de l'image (0 à 1, x/y = coin haut gauche) qui contient TOUT le dessin, "anchor" = intitulé (label) de la rubrique où il se trouve, null s'il est dans l'en-tête.`,
 };
 
 function parseJson(text: string) {
@@ -142,7 +143,7 @@ async function withAi(teacherId: string, kind: ImportKind, mime: string, buf: Bu
         ? curriculumOut.parse(raw)
         : {
             content: prepOut.parse(raw.content ?? raw),
-            layout: prepLayoutSchema.safeParse({ ...raw.layout, images: undefined, style: prepStyleSchema.safeParse(raw.layout?.style).data ?? null }).data ?? null,
+            layout: lenientLayout(raw.layout),
             figures: figuresOut.safeParse(raw.layout?.figures).data ?? [],
           };
     await AiJob.updateOne({ _id: job._id }, { status: "done", "steps.0.status": "done", "steps.0.finishedAt": new Date(), $unset: { lockedBy: 1, lockedUntil: 1 } });
@@ -175,6 +176,8 @@ export async function analyzeImport(o: { teacherId: string; kind: ImportKind; bu
       data = out.content;
       layout = out.layout;
       figures = out.figures;
+      // PDF tapé : la lecture directe du texte connaît le cartouche et les intitulés TELS QU'ÉCRITS.
+      if (text.trim().length > 20) layout = mergeLayouts(layout, parsePrepText(text).layout, data);
     } else data = out;
   } else if (text.trim().length > 20) {
     // Sans IA : lecture déterministe du texte du PDF (contenu et mise en page repérée).
@@ -205,6 +208,29 @@ export async function analyzeImport(o: { teacherId: string; kind: ImportKind; bu
   return { kind: o.kind, source, data, layout, uploadId };
 }
 
+const normLabel = (x: string) => x.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[\s:]+$/g, "").replace(/\s+/g, " ").trim();
+
+/**
+ * Fiche PDF lue par l'IA : son contenu (mieux structuré) est gardé, mais le cartouche (valeurs d'origine,
+ * « Domaine : Mathématiques ») et les intitulés exacts (« Objectif spécifique : ») viennent de la lecture
+ * directe du texte quand elle les a trouvés. Une rubrique que l'IA a tirée d'un champ du cartouche est retirée.
+ */
+export function mergeLayouts(ai: PrepLayout | null, det: PrepLayout | null, content: PrepContent): PrepLayout | null {
+  if (!ai || !det) return ai ?? det;
+  const header = det.header?.length ? det.header : ai.header;
+  const inHeader = new Set((header ?? []).map((h) => normLabel(h.label)));
+  const asWritten = new Map((det.sections ?? []).map((x) => [normLabel(x.label), x.label]));
+  const label = (l: string) => asWritten.get(normLabel(l)) ?? l;
+  const sections = (ai.sections ?? []).filter((x) => !inHeader.has(normLabel(x.label))).map((x) => ({ ...x, label: label(x.label) }));
+  if (content.extra) {
+    const extra = content.extra.filter((x) => !inHeader.has(normLabel(x.label))).map((x) => ({ ...x, label: label(x.label) }));
+    if (extra.length) content.extra = extra;
+    else delete content.extra;
+  }
+  const merged = prepLayoutSchema.safeParse({ ...ai, title: ai.title ?? det.title, header, sections: sections.length ? sections : det.sections, stepColumns: ai.stepColumns ?? det.stepColumns });
+  return merged.success ? merged.data : ai;
+}
+
 /**
  * Apparence de la fiche d'origine : police, titre, intitulés, couleur, et dessins.
  * PDF : relevée dans le dessin de la page (plus sûr que l'IA), dessins recadrés et stockés en PNG.
@@ -226,14 +252,26 @@ async function withLook(teacherId: string, mime: string, buf: Buffer, layout: Pr
   } else if ((mime === "image/jpeg" || mime === "image/png") && figures.length) {
     const size = imageSize(buf);
     if (size) {
+      // Le modèle donne une rubrique par son intitulé, parfois par sa clé (« exercises ») : on ramène à l'intitulé.
+      const anchorOf = (a: string | null | undefined) => {
+        if (!a) return null;
+        const byKey = (SECTION_KEYS as readonly string[]).includes(a) ? layout?.sections?.find((s) => s.key === a)?.label : undefined;
+        return byKey ?? layout?.sections?.find((s) => normLabel(s.label) === normLabel(a))?.label ?? a;
+      };
       for (const f of figures) {
-        const box = { x: f.box.x, y: f.box.y, w: Math.min(f.box.w, 1 - f.box.x), h: Math.min(f.box.h, 1 - f.box.y) };
+        // Les cadres d'un modèle sont approximatifs : petite marge (plus forte, en proportion, pour un petit logo)
+        // pour ne pas couper le dessin, sans englober ce qui l'entoure.
+        const px = 0.012 + f.box.w * 0.04;
+        const py = 0.01 + f.box.h * 0.04;
+        const x0 = Math.max(0, f.box.x - px);
+        const y0 = Math.max(0, f.box.y - py);
+        const box = { x: x0, y: y0, w: Math.min(1, f.box.x + f.box.w + px) - x0, h: Math.min(1, f.box.y + f.box.h + py) - y0 };
         if (box.w < 0.02 || box.h < 0.02) continue;
         const mid = box.x + box.w / 2;
         images.push({
           url: sourceUrl,
           crop: box,
-          anchor: f.anchor ?? null,
+          anchor: anchorOf(f.anchor),
           position: mid < 0.38 ? "left" : mid > 0.62 ? "right" : "center",
           widthPct: Math.round(Math.min(60, Math.max(5, box.w * 100)) * 10) / 10,
           aspect: Math.round(((box.w * size.w) / (box.h * size.h)) * 1000) / 1000,

@@ -4,9 +4,15 @@ import { logger } from "../utils/logger.js";
 
 let memoryServer: { stop: () => Promise<boolean> } | null = null;
 
+/** Nom de base de l'adresse, s'il y en a un (« mongodb+srv://hôte/pedago?… » → « pedago »). */
+export function uriDbName(uri: string) {
+  return uri.match(/^mongodb(?:\+srv)?:\/\/[^/]+\/([^/?]+)/)?.[1];
+}
+
 export async function connectDb() {
   mongoose.set("strictQuery", true);
   const options = {
+    dbName: uriDbName(env.mongoUri) ?? env.mongoDb,
     maxPoolSize: Number(process.env.MONGO_MAX_POOL || 40),
     minPoolSize: 2,
     maxIdleTimeMS: 30_000,

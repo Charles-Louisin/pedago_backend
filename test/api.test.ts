@@ -129,7 +129,7 @@ test("sources : liste blanche, pas d'URL arbitraire ni de javascript:", async ()
   const admin = await staffToken("admin@pedago.test", "Pedago-Admin-2026!");
   const post = (body: object) => call("/admin/sources", { method: "POST", token: admin, body: { title: "Test source", issuer: "MINEDUB", ...body } });
   assert.equal((await post({ url: "https://evil.example.com/x.pdf" })).status, 400);
-  assert.equal((await post({ fileUrl: "http://127.0.0.1:5100/api/v1/health" })).status, 400);
+  assert.equal((await post({ fileUrl: "http://127.0.0.1:5000/api/v1/health" })).status, 400);
   assert.equal((await post({ url: "javascript:alert(1)" })).status, 400);
   assert.equal((await post({ url: "https://www.minedub.cm/programme.pdf" })).status, 201);
 });
@@ -193,6 +193,31 @@ test("relecture : PDF de la ressource avant validation, mention « À valider »
   // Un enseignant n'y a pas accès.
   const teacher = (await login("enseignant@pedago.test", "Pedago-Enseignant-2026!")).body.accessToken;
   assert.equal((await fetch(`${base}/api/v1/admin/resources/${r!._id}/pdf`, { headers: { Authorization: `Bearer ${teacher}` } })).status, 403);
+});
+
+test("inscription : un service d'e-mail en panne ne bloque pas le compte, le renvoi signale l'échec", async () => {
+  const { env } = await import("../src/config/env.js");
+  const realFetch = globalThis.fetch;
+  const saved = { key: env.resendApiKey, echo: env.devEchoCodes };
+  (env as { resendApiKey: string }).resendApiKey = "test-key";
+  (env as { devEchoCodes: boolean }).devEchoCodes = false;
+  // Le service d'e-mail répond 403 (expéditeur non vérifié) ; le reste du réseau est inchangé.
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) =>
+    String(input).startsWith("https://api.resend.com") ? new Response("{}", { status: 403 }) : realFetch(input, init)) as typeof fetch;
+  try {
+    const reg = await call("/auth/register", { method: "POST", body: { fullName: "Sans Courriel", email: "sans-courriel@pedago.test", password: "Pedago-Sans-2026!", passwordConfirm: "Pedago-Sans-2026!" } });
+    assert.equal(reg.status, 201);
+    assert.equal(reg.body.mailSent, false);
+    assert.ok(reg.body.accessToken);
+    await User.updateOne({ email: "sans-courriel@pedago.test" }, { $unset: { emailCodeSentAt: 1 } });
+    const again = await call("/auth/resend-code", { method: "POST", token: reg.body.accessToken });
+    assert.equal(again.status, 502);
+    assert.equal(again.body.code, "MAIL_FAILED");
+  } finally {
+    globalThis.fetch = realFetch;
+    (env as { resendApiKey: string }).resendApiKey = saved.key;
+    (env as { devEchoCodes: boolean }).devEchoCodes = saved.echo;
+  }
 });
 
 test("désactiver un compte ferme ses sessions immédiatement", async () => {

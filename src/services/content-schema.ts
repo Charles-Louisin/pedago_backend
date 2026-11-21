@@ -6,7 +6,9 @@ import { z } from "zod";
  */
 const exercise = z.object({
   prompt: z.string().min(3).max(2000),
-  answer: z.string().min(1).max(2000),
+  // Un corrigé absent ne fait pas échouer la génération (une relance coûte un nouvel appel au modèle) :
+  // il est signalé comme erreur bloquante par deterministicChecks, et la relecture humaine le complète.
+  answer: z.string().max(2000).nullish().transform((v) => v ?? ""),
   explanation: z.string().max(2000).optional(),
   points: z.number().min(0).max(100).optional(),
   competency: z.string().max(300).optional(),
@@ -73,5 +75,9 @@ export function deterministicChecks(content: LessonContent, expectedDuration?: n
     if (noCompetency) issues.push({ severity: "warning", area: "compétence", message: `${noCompetency} question(s) non reliée(s) à une compétence` });
   }
   if (!content.objectives.length) issues.push({ severity: "warning", area: "objectifs", message: "Aucun objectif pédagogique" });
+  // Fiche imprimée en noir et blanc, polices sans emoji : un pictogramme sortirait illisible sur le PDF.
+  const emoji = /\p{Extended_Pictographic}/u;
+  const texts = [content.competency, content.writtenTrace, content.body, ...content.objectives, ...content.materials, ...content.steps.flatMap((s) => [s.name, ...s.teacherActivities, ...s.learnerActivities]), ...[...content.exercises, ...content.assessment].flatMap((e) => [e.prompt, e.answer])];
+  if (texts.some((t) => t && emoji.test(t))) issues.push({ severity: "error", area: "impression", message: "Emoji ou pictogramme dans le texte : à remplacer par des mots ou une illustration décrite" });
   return issues;
 }

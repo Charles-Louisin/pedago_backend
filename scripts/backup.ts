@@ -19,11 +19,13 @@ if (!key && process.env.NODE_ENV === "production") {
 }
 
 const client = new MongoClient(uri);
+// Base nommée dans l'adresse, sinon MONGODB_DB (« pedago ») : comme l'API, jamais la base « test » par défaut.
+const dbNameOf = (u: string) => u.match(/^mongodb(?:\+srv)?:\/\/[^/]+\/([^/?]+)/)?.[1] ?? process.env.MONGODB_DB ?? "pedago";
 const started = Date.now();
 try {
   await client.connect();
   const dir = path.join(root, stamp());
-  const m = await backupDatabase(client.db(), dir, key);
+  const m = await backupDatabase(client.db(dbNameOf(uri)), dir, key);
   const total = m.collections.reduce((s, c) => s + c.count, 0);
   console.log(`Sauvegarde ${m.encrypted ? "chiffrée " : ""}de « ${m.database} » : ${m.collections.length} collections, ${total} documents → ${dir} (${Date.now() - started} ms)`);
   const removed = pruneBackups(root, days);

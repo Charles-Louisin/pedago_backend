@@ -18,12 +18,14 @@ if (!dir || !uri) {
 }
 
 const client = new MongoClient(uri);
+// Base nommée dans l'adresse, sinon MONGODB_DB (« pedago ») : comme l'API, jamais la base « test » par défaut.
+const dbNameOf = (u: string) => u.match(/^mongodb(?:\+srv)?:\/\/[^/]+\/([^/?]+)/)?.[1] ?? process.env.MONGODB_DB ?? "pedago";
 try {
   await client.connect();
-  const { manifest, report } = await restoreDatabase(client.db(), path.resolve(dir), backupKey(), { drop: args.includes("--drop") });
+  const { manifest, report } = await restoreDatabase(client.db(dbNameOf(uri)), path.resolve(dir), backupKey(), { drop: args.includes("--drop") });
   const bad = report.filter((r) => r.restored !== r.expected);
   for (const r of report) console.log(`${r.restored === r.expected ? "✓" : "✗"} ${r.name} : ${r.restored}/${r.expected}`);
-  console.log(`Restauration de la sauvegarde du ${manifest.createdAt} dans « ${client.db().databaseName} » : ${bad.length ? "INCOMPLÈTE" : "complète"}`);
+  console.log(`Restauration de la sauvegarde du ${manifest.createdAt} dans « ${client.db(dbNameOf(uri)).databaseName} » : ${bad.length ? "INCOMPLÈTE" : "complète"}`);
   if (bad.length) process.exitCode = 1;
 } catch (e) {
   console.error("Échec de la restauration :", (e as Error).message);

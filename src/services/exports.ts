@@ -171,10 +171,10 @@ function sections(d: Doc): Block[] {
 /* ───────── Apparence : celle de la fiche de l'enseignant, sinon la présentation PEDAGO ───────── */
 
 const require_ = createRequire(import.meta.url);
-/** Police manuscrite (Caveat, licence OFL) pour les fiches écrites à la main. */
+/** Police manuscrite (Caveat, licence OFL) pour les fiches écrites à la main. WOFF et non WOFF2 : fontkit plante en sous-ensemblant le WOFF2. */
 const SCRIPT_FONTS = (() => {
   try {
-    return { regular: require_.resolve("@fontsource/caveat/files/caveat-latin-400-normal.woff2"), bold: require_.resolve("@fontsource/caveat/files/caveat-latin-700-normal.woff2") };
+    return { regular: require_.resolve("@fontsource/caveat/files/caveat-latin-400-normal.woff"), bold: require_.resolve("@fontsource/caveat/files/caveat-latin-700-normal.woff") };
   } catch {
     return null;
   }
@@ -241,8 +241,10 @@ const L = 56;
 const W = 483;
 
 /** Dessine une image (ou la découpe d'une photo) à sa place ; renvoie sa hauteur. */
-function drawImage(pdf: PDFKit.PDFDocument, img: PrepImage, buf: Buffer | undefined, y: number) {
-  if (!buf) return 0;
+/** @param src image déjà ouverte par PDFKit (une photo découpée deux fois n'est embarquée qu'une fois). */
+function drawImage(pdf: PDFKit.PDFDocument, img: PrepImage, src: unknown, y: number) {
+  if (!src) return 0;
+  const buf = src as Buffer;
   const w = Math.min(W, (img.widthPct / 100) * PAGE_W);
   const h = w / img.aspect;
   const x = img.position === "left" ? L : img.position === "right" ? L + W - w : L + (W - w) / 2;
@@ -267,6 +269,14 @@ async function renderPdf(d: Doc): Promise<Buffer> {
     pdf.on("end", () => resolve(Buffer.concat(chunks)));
     pdf.on("error", reject);
 
+    // Chaque image est ouverte (et donc embarquée) une seule fois, même découpée plusieurs fois.
+    const cache = new Map<string, unknown>();
+    const opened = (url: string) => {
+      const buf = images.get(url);
+      if (!buf) return undefined;
+      if (!cache.has(url)) cache.set(url, (pdf as unknown as { openImage: (b: Buffer) => unknown }).openImage(buf));
+      return cache.get(url);
+    };
     let fam = FAMILIES[st.font];
     if (st.font === "script") {
       if (SCRIPT_FONTS) {
@@ -283,7 +293,7 @@ async function renderPdf(d: Doc): Promise<Buffer> {
     const hdr = headerImages(d).filter((i) => images.has(i.url));
     let top = 56;
     let band = 0;
-    for (const img of hdr) band = Math.max(band, drawImage(pdf, img, images.get(img.url), top));
+    for (const img of hdr) band = Math.max(band, drawImage(pdf, img, opened(img.url), top));
     const sideOnly = hdr.length > 0 && !hdr.some((i) => i.position === "center");
     let tx = L;
     let tw = W;
@@ -369,7 +379,7 @@ async function renderPdf(d: Doc): Promise<Buffer> {
         const h = Math.min(W, (img.widthPct / 100) * PAGE_W) / img.aspect;
         if (pdf.y + h + 6 > 780) pdf.addPage();
         const y = pdf.y + 6;
-        pdf.y = y + drawImage(pdf, img, buf, y);
+        pdf.y = y + drawImage(pdf, img, opened(img.url), y);
       }
       pdf.x = L;
       pdf.moveDown(0.8);

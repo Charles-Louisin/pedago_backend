@@ -54,6 +54,8 @@ Exigences :
 - Ajoute des conseils pour une classe nombreuse (souvent plus de 60 élèves).
 - Chaque question d'évaluation a un corrigé, un barème (points) et la compétence évaluée.
 - Les calculs des corrigés doivent être justes.
+- Aucun emoji ni pictogramme (🥭, ●, ✓…) : la fiche est imprimée en noir et blanc. Écris les quantités en mots ou en chiffres et décris le dessin attendu dans le champ "illustration".
+- Chaque exercice et chaque question d'évaluation a un champ "answer" non vide.
 
 Réponds UNIQUEMENT en JSON avec ce schéma :
 {"title":"…","summary":"…","content":{"generalInfo":{"domain":"…","durationMin":${args.durationMin}},
