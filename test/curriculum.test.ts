@@ -8,6 +8,7 @@ import { MongoMemoryServer } from "mongodb-memory-server";
 import { createApp } from "../src/app.js";
 import { seedDatabase } from "../src/seed/seed.js";
 import { parseProgression, similarity } from "../src/services/curriculum.js";
+import { parsePrepText } from "../src/services/layout.js";
 import { localExportsDir } from "../src/services/storage.js";
 
 let mongo: MongoMemoryServer;
@@ -61,6 +62,43 @@ Trimestre 2
   assert.equal(lessons[0].week, 1);
   // Un titre court suivi de « : » est un titre complet, pas un titre + objectif.
   assert.deepEqual(parseProgression("4. Lecture : la famille de Mbarga")[0], { title: "Lecture : la famille de Mbarga", objectives: [], term: null, week: null });
+});
+
+test("fiche « maison » tapée : rubriques à qualificatif, cartouche avec valeurs, en-tête de tableau ignoré", () => {
+  const { content, layout } = parsePrepText(`FICHE DE PRÉPARATION
+École : EP Bastos
+Classe : CP
+Effectif : 62
+Date :
+Domaine : Mathématiques
+Objectif spécifique :
+- Additionner deux nombres inférieurs à 10
+Matériel didactique : capsules, ardoises
+Déroulement
+Étapes   Durée   Activités du maître   Activités des élèves
+Rappel (5 min) : calcul mental
+Découverte (20 min) : manipulation des capsules ; mise en commun
+Méthode :
+Travail en groupes
+Je retiens
+Pour additionner, je réunis deux quantités.
+Exercices
+- 3 + 4 → 7`);
+  assert.deepEqual(content.objectives, ["Additionner deux nombres inférieurs à 10"]);
+  assert.deepEqual(content.materials, ["capsules", "ardoises"]);
+  assert.deepEqual(content.steps?.map((x) => [x.name, x.durationMin]), [["Rappel", 5], ["Découverte", 20]]);
+  assert.equal(content.writtenTrace, "Pour additionner, je réunis deux quantités.");
+  assert.deepEqual(content.exercises, [{ prompt: "3 + 4", answer: "7" }]);
+  assert.deepEqual(content.extra, [{ label: "Méthode", lines: ["Travail en groupes"] }]);
+  assert.deepEqual(layout?.header?.map((h) => [h.label, h.field, h.value ?? null]), [
+    ["École", "school", "EP Bastos"],
+    ["Classe", "class", "CP"],
+    ["Effectif", "effectif", "62"],
+    ["Date", "date", null],
+    ["Domaine", "other", "Mathématiques"],
+  ]);
+  assert.deepEqual(layout?.sections?.map((x) => x.label), ["Objectif spécifique", "Matériel didactique", "Déroulement", "Méthode", "Je retiens", "Exercices"]);
+  assert.equal(layout?.stepColumns?.length, 4);
 });
 
 test("rapprochement de titres proches", () => {

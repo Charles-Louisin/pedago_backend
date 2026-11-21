@@ -69,6 +69,15 @@ function stepsTable(c: LessonContent, columns: { key: string; label: string }[])
 }
 
 const bullets = (xs: string[]) => xs.map((o) => `• ${o}`);
+type Answerable = { answer?: string; explanation?: string };
+/** Lignes du corrigé : numéro tel qu'affiché dans chaque liste, exercices sans réponse sautés. */
+function answerLines(exercises: Answerable[], assessment: Answerable[] = []) {
+  const one = (items: Answerable[], prefix: string) =>
+    items.flatMap((e, i) => (e.answer?.trim() ? [`${prefix}${i + 1}. ${e.answer}${e.explanation ? ` — ${e.explanation}` : ""}`] : []));
+  const a = one(exercises, "");
+  const b = one(assessment, exercises.length ? "Évaluation " : "");
+  return [...a, ...b];
+}
 const exerciseItem = (e: { prompt: string; points?: number; illustration?: string }, i: number) =>
   `${i + 1}. ${e.prompt}${e.points ? ` (${e.points} pts)` : ""}${e.illustration ? `\n    Illustration : ${e.illustration}` : ""}`;
 
@@ -119,8 +128,10 @@ function layoutSections(d: Doc, layout: PrepLayout): Block[] {
     }
   }
   for (const x of d.extra ?? []) if (!usedExtra.has(x.label.toLowerCase()) && x.lines.length) out.push({ heading: x.label, lines: x.lines });
-  const answers = [...c.exercises, ...c.assessment].filter((e) => e.answer);
-  if (answers.length && d.includeAnswers !== false) out.push({ heading: "Corrigé", lines: answers.map((e, i) => `${i + 1}. ${e.answer}${e.explanation ? ` — ${e.explanation}` : ""}`) });
+  // Corrigé : seulement pour les listes affichées par le modèle, avec la numérotation de ces listes.
+  const shown = new Set((layout.sections ?? []).map((s) => s.key));
+  const lines = answerLines(shown.has("exercises") ? c.exercises : [], shown.has("assessment") ? c.assessment : []);
+  if (lines.length && d.includeAnswers !== false) out.push({ heading: "Corrigé", lines });
   return out;
 }
 
@@ -144,9 +155,8 @@ function sections(d: Doc): Block[] {
     `${i + 1}. ${e.prompt}${e.points ? ` (${e.points} pts)` : ""}${e.illustration ? `\n    Illustration : ${e.illustration}` : ""}`;
   if (c.exercises.length) out.push({ heading: "Exercices d'application", lines: c.exercises.map(item) });
   if (c.assessment.length) out.push({ heading: "Évaluation", lines: c.assessment.map(item) });
-  const answers = [...c.exercises, ...c.assessment];
-  if (answers.length && d.includeAnswers !== false)
-    out.push({ heading: "Corrigé", lines: answers.map((e, i) => `${i + 1}. ${e.answer}${e.explanation ? ` — ${e.explanation}` : ""}`) });
+  const answers = answerLines(c.exercises, c.assessment);
+  if (answers.length && d.includeAnswers !== false) out.push({ heading: "Corrigé", lines: answers });
   if (d.remarks) out.push({ heading: "Remarques", lines: d.remarks.split("\n") });
   if (c.lowResourceAlternatives.length)
     out.push({ heading: "Sans électricité ni matériel spécialisé", lines: c.lowResourceAlternatives.map((o) => `• ${o}`) });
@@ -452,7 +462,7 @@ export async function composeLessonDoc(o: ComposeOptions) {
   if (p.materials?.length) base.materials = p.materials;
   if (p.steps?.length) base.steps = p.steps;
   if (p.writtenTrace) base.writtenTrace = p.writtenTrace;
-  if (p.exercises?.length) base.exercises = p.exercises.map((e) => ({ prompt: e.prompt, answer: e.answer || "—" }));
+  if (p.exercises?.length) base.exercises = p.exercises.map((e) => ({ prompt: e.prompt, answer: e.answer ?? "" }));
   if (base.body?.startsWith("CONTENU DE DÉMONSTRATION")) base.body = undefined;
 
   // Niveau de difficulté : la bibliothèque a peut-être la bonne variante ; sinon l'IA adapte la fiche.
@@ -498,7 +508,7 @@ export async function composeLessonDoc(o: ComposeOptions) {
     other: "",
   };
   const meta: [string, string][] = layout?.header?.length
-    ? layout.header.map((h) => [h.label, values[h.field] ?? ""])
+    ? layout.header.map((h) => [h.label, (h.field === "other" ? h.value : values[h.field] || h.value) ?? ""])
     : [
         ["Enseignant", values.teacher],
         ["École", values.school],

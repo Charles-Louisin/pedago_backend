@@ -6,8 +6,8 @@ import { AiJob, TeacherUpload } from "../models/index.js";
 import { AiNotConfiguredError, BudgetExceededError, chat, type ChatMessage } from "../ai/openrouter.js";
 import { HttpError } from "../utils/http-error.js";
 import { parseProgression } from "./curriculum.js";
-import { formToContent, parsePastedPrep, type PrepContent } from "./prep-text.js";
-import { detectLayout, prepLayoutSchema, type PrepLayout } from "./layout.js";
+import type { PrepContent } from "./prep-text.js";
+import { parsePrepText, prepLayoutSchema, type PrepLayout } from "./layout.js";
 import { storeFile } from "./storage.js";
 
 /**
@@ -166,8 +166,10 @@ export async function analyzeImport(o: { teacherId: string; kind: ImportKind; bu
       if (!lessons.length) throw new HttpError(422, "IMPORT_EMPTY", "Aucune leçon reconnue dans ce PDF");
       data = { lessons };
     } else {
-      data = formToContent(parsePastedPrep(text));
-      layout = detectLayout(text);
+      // Contenu et modèle lus en un passage (intitulés de l'enseignant, cartouche, colonnes).
+      const parsed = parsePrepText(text);
+      data = parsed.content;
+      layout = parsed.layout;
     }
   } else {
     throw new AiNotConfiguredErrorHttp();

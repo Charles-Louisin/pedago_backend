@@ -7,6 +7,8 @@ export type PrepContent = {
   writtenTrace?: string;
   exercises?: { prompt: string; answer: string }[];
   notes?: string;
+  /** Rubriques propres à l'enseignant (« Domaine », « Méthode »…). */
+  extra?: { label: string; lines: string[] }[];
 };
 
 /** Champs texte de l'éditeur de fiche : une idée par ligne. */
