@@ -2,7 +2,7 @@ import jwt from "jsonwebtoken";
 import crypto from "node:crypto";
 import { env } from "../config/env.js";
 
-export type Role = "teacher" | "reviewer" | "admin";
+export type Role = "teacher" | "admin";
 /** ev : e-mail vérifié ; mfa : session ouverte avec la double authentification. */
 export type AccessPayload = { sub: string; role: Role; sid: string; ev?: boolean; mfa?: boolean };
 

@@ -1,5 +1,5 @@
 import { Types } from "mongoose";
-import { AcademicCalendar, CatchUpItem, CurriculumNode, LessonInstance, Timetable } from "../models/index.js";
+import { AcademicCalendar, CatchUpItem, CurriculumNode, LessonInstance, Timetable, TIMETABLE_HISTORY_MAX } from "../models/index.js";
 import { addDays, eachDay, weekday } from "../utils/dates.js";
 import { lessonsFor } from "./curriculum.js";
 
@@ -21,6 +21,39 @@ export async function lessonNodes(classLevel: string, subjectCode: string) {
     .sort({ order: 1 })
     .select("_id title objectives durationMin prerequisites priority term order")
     .lean();
+}
+
+export type PlanSlot = { _id?: unknown; weekday: number; start: string; end: string; subjectCode: string };
+
+/**
+ * Cœur déterministe de la planification, sans base de données : jour après jour (jours de classe seulement),
+ * chaque créneau d'une matière reçoit la leçon suivante de sa file. Les curseurs avancent sur place.
+ * Utilisé par `ensurePlan` (séances réelles) et par l'aperçu de progression d'un import (rien n'est écrit).
+ */
+export function distributeLessons<N>(o: {
+  slots: PlanSlot[];
+  from: string;
+  to: string;
+  isSchoolDay: (date: string) => boolean;
+  cursors: Map<string, { nodes: N[]; next: number }>;
+  /** Créneaux déjà occupés (« date|début ») : laissés tels quels. */
+  taken?: Set<string>;
+}) {
+  const out: { date: string; slot: PlanSlot; node: N }[] = [];
+  const byDay = new Map<number, PlanSlot[]>();
+  for (const s of [...o.slots].sort((a, b) => a.start.localeCompare(b.start))) byDay.set(s.weekday, [...(byDay.get(s.weekday) ?? []), s]);
+  for (const date of eachDay(o.from, o.to)) {
+    if (!o.isSchoolDay(date)) continue;
+    for (const slot of byDay.get(weekday(date)) ?? []) {
+      if (o.taken?.has(`${date}|${slot.start}`)) continue;
+      const cursor = o.cursors.get(slot.subjectCode);
+      const node = cursor?.nodes[cursor.next];
+      if (!cursor || !node) continue;
+      cursor.next += 1;
+      out.push({ date, slot, node });
+    }
+  }
+  return out;
 }
 
 /**
@@ -60,30 +93,17 @@ export async function ensurePlan(teacherId: string, classLevel: string, schoolYe
     cursors.set(subjectCode, { nodes, next: firstFree === -1 ? nodes.length : firstFree });
   }
 
-  const docs: Record<string, unknown>[] = [];
-  for (const date of eachDay(from, to)) {
-    if (!isSchoolDay(cal, date)) continue;
-    const wd = weekday(date);
-    const slots = timetable.slots.filter((s) => s.weekday === wd).sort((a, b) => a.start.localeCompare(b.start));
-    for (const slot of slots) {
-      if (taken.has(`${date}|${slot.start}`)) continue;
-      const cursor = cursors.get(slot.subjectCode)!;
-      const node = cursor.nodes[cursor.next];
-      if (!node) continue;
-      cursor.next += 1;
-      docs.push({
-        teacherId,
-        classLevel,
-        subjectCode: slot.subjectCode,
-        nodeId: node._id,
-        date,
-        start: slot.start,
-        end: slot.end,
-        slotId: slot._id,
-        origin: "plan",
-      });
-    }
-  }
+  const docs = distributeLessons({ slots: timetable.slots, from, to, isSchoolDay: (d) => isSchoolDay(cal, d), cursors, taken }).map(({ date, slot, node }) => ({
+    teacherId,
+    classLevel,
+    subjectCode: slot.subjectCode,
+    nodeId: node._id,
+    date,
+    start: slot.start,
+    end: slot.end,
+    slotId: slot._id,
+    origin: "plan",
+  }));
   if (docs.length) await LessonInstance.insertMany(docs, { ordered: false });
   const plannedFrom = timetable.plannedFrom && timetable.plannedFrom < from ? timetable.plannedFrom : from;
   const plannedThrough = timetable.plannedThrough && timetable.plannedThrough > to ? timetable.plannedThrough : to;
@@ -94,6 +114,48 @@ export async function ensurePlan(teacherId: string, classLevel: string, schoolYe
     contiguous ? { plannedFrom, plannedThrough } : { plannedFrom: from, plannedThrough: to }
   );
   return docs.length;
+}
+
+export type TimetableInput = {
+  slots: { weekday: number; start: string; end: string; subjectCode: string; room?: string | null; label?: string | null }[];
+  extras?: { weekday: number; start: string; end: string; kind: "break" | "special"; label: string }[];
+  source: "manual" | "import" | "proposal";
+  importId?: string;
+};
+
+/**
+ * Enregistre une NOUVELLE VERSION de l'emploi du temps : l'état précédent part dans l'historique
+ * (20 versions gardées), le repère de planification est effacé et les séances futures encore « prévues »
+ * sont supprimées pour être recalculées. Le passé (fait, partiel, manqué) n'est jamais touché.
+ */
+export async function saveTimetableVersion(teacherId: string, classLevel: string, schoolYear: string, input: TimetableInput, today: string) {
+  const current = await Timetable.findOne({ teacherId, classLevel, schoolYear }).lean();
+  const strip = <T extends Record<string, unknown>>(o: T) => Object.fromEntries(Object.entries(o).filter(([, v]) => v != null && v !== "")) as T;
+  const snapshot = current
+    ? {
+        version: current.version,
+        source: current.source ?? "manual",
+        importId: current.importId,
+        slots: current.slots.map((s) => strip({ weekday: s.weekday, start: s.start, end: s.end, subjectCode: s.subjectCode, room: s.room, label: s.label })),
+        extras: current.extras ?? [],
+        savedAt: current.updatedAt ?? new Date(),
+      }
+    : null;
+  const tt = await Timetable.findOneAndUpdate(
+    { teacherId, classLevel, schoolYear },
+    {
+      slots: input.slots.map(strip),
+      extras: input.extras ?? [],
+      source: input.source,
+      ...(input.importId ? { importId: input.importId } : {}),
+      $unset: { plannedFrom: 1, plannedThrough: 1, ...(input.importId ? {} : { importId: 1 }) },
+      $inc: { version: 1 },
+      ...(snapshot ? { $push: { history: { $each: [snapshot], $slice: -TIMETABLE_HISTORY_MAX } } } : {}),
+    },
+    { upsert: true, new: true, runValidators: true }
+  ).lean();
+  await LessonInstance.deleteMany({ teacherId, classLevel, date: { $gt: today }, status: "planned", origin: "plan" });
+  return tt!;
 }
 
 type Option =

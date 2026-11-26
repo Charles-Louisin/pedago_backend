@@ -11,7 +11,7 @@ import { getCalendar } from "../services/planning.js";
 export const libraryRouter = Router();
 libraryRouter.use(requireAuth, requireVerifiedEmail);
 
-const LIST_FIELDS = "_id type title summary classLevel subjectCode nodeId difficulty illustrationLevel durationMin contentVersion updatedAt";
+const LIST_FIELDS = "_id type title summary classLevel subjectCode nodeId difficulty illustrationLevel durationMin contentVersion updatedAt assets.pdf.sizeBytes assets.pdf.contentVersion";
 
 const searchSchema = z.object({
   classLevel: z.enum(ALL_CLASS_LEVELS).optional(),
@@ -41,7 +41,13 @@ libraryRouter.get(
         .lean(),
       Resource.countDocuments(filter),
     ]);
-    res.json({ items: items.map(({ _id, ...r }) => ({ id: String(_id), ...r })), total, page: q.page, limit: q.limit });
+    // Taille du PDF à jour (si déjà produit) : affichée sur la carte avant le téléchargement.
+    res.json({
+      items: items.map(({ _id, assets, ...r }) => ({ id: String(_id), ...r, pdfBytes: assets?.pdf?.contentVersion === r.contentVersion ? assets.pdf.sizeBytes ?? null : null })),
+      total,
+      page: q.page,
+      limit: q.limit,
+    });
   })
 );
 

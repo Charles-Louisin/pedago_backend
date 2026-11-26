@@ -235,7 +235,6 @@ export async function seedDatabase() {
 
   const accounts = [
     { email: process.env.SEED_ADMIN_EMAIL || "admin@pedago.test", password: process.env.SEED_ADMIN_PASSWORD || "Pedago-Admin-2026!", fullName: "Administrateur PEDAGO", role: "admin" },
-    { email: process.env.SEED_REVIEWER_EMAIL || "relecteur@pedago.test", password: process.env.SEED_REVIEWER_PASSWORD || "Pedago-Relecteur-2026!", fullName: "Relecteur pédagogique", role: "reviewer" },
     { email: process.env.SEED_TEACHER_EMAIL || "enseignant@pedago.test", password: process.env.SEED_TEACHER_PASSWORD || "Pedago-Enseignant-2026!", fullName: "Enseignant démo", role: "teacher" },
   ];
   for (const a of accounts) {

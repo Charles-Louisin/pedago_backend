@@ -45,6 +45,21 @@ const curriculumNodeSchema = new Schema(
     matchedNodeId: { type: Schema.Types.ObjectId, ref: "CurriculumNode" },
     /** Leçon déjà enseignée avant l'import de la progression (non replanifiée, comptée comme faite). */
     alreadyTaught: { type: Boolean, default: false },
+    /**
+     * Champs lus sur le document de l'enseignant (progression importée), recopiés tels quels :
+     * intitulé du niveau (« Séquence 2 », « Unité 1 »), période écrite, semaine, activités, évaluations,
+     * prérequis cités en toutes lettres (rattachés en `prerequisites` quand la leçon citée existe).
+     */
+    label: { type: String, maxlength: 80 },
+    period: { type: String, maxlength: 80 },
+    week: { type: Number, min: 1, max: 60 },
+    activities: { type: [String], default: undefined },
+    assessments: { type: [String], default: undefined },
+    prerequisiteNotes: { type: [String], default: undefined },
+    /** Durée écrite sur le document (absente = non indiquée ; `durationMin` garde alors la valeur par défaut). */
+    durationStated: { type: Boolean, default: undefined },
+    /** Import validé dont vient ce nœud. */
+    importId: { type: Schema.Types.ObjectId, ref: "TeacherImport" },
   },
   { timestamps: true }
 );

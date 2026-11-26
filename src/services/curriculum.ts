@@ -99,16 +99,7 @@ export async function saveTeacherCurriculum(teacherId: string, classLevel: strin
     .lean();
   await CurriculumNode.updateMany({ ownerId: teacherId, classLevel, subjectCode, status: { $ne: "retired" } }, { status: "retired" });
   const docs = lessons.map((l, i) => {
-    let best: (typeof official)[number] | null = null;
-    let score = 0;
-    for (const o of official) {
-      const s = similarity(l.title, o.title);
-      if (s > score) {
-        score = s;
-        best = o;
-      }
-    }
-    const match = score >= 0.45 ? best : null;
+    const match = bestMatch(official, l.title)?.node ?? null;
     return {
       ownerId: new Types.ObjectId(teacherId),
       subsystem: subsystemOf(classLevel as ClassLevel),
@@ -131,6 +122,118 @@ export async function saveTeacherCurriculum(teacherId: string, classLevel: strin
   await LessonInstance.deleteMany({ teacherId, classLevel, subjectCode, date: { $gt: today }, status: "planned", origin: "plan" });
   await Timetable.updateMany({ teacherId, classLevel }, { $unset: { plannedFrom: 1, plannedThrough: 1 } });
   return { count: created.length, matched: docs.filter((d) => d.matchedNodeId).length };
+}
+
+/** Seuil de rapprochement d'un titre de l'enseignant avec une leçon officielle. */
+export const MATCH_THRESHOLD = 0.45;
+
+/** Leçon officielle la plus proche d'un titre (null sous le seuil). */
+export function bestMatch<T extends { title: string }>(candidates: T[], title: string, threshold = MATCH_THRESHOLD) {
+  let best: T | null = null;
+  let score = 0;
+  for (const c of candidates) {
+    const s = similarity(title, c.title);
+    if (s > score) {
+      score = s;
+      best = c;
+    }
+  }
+  return best && score >= threshold ? { node: best, score } : null;
+}
+
+/** Nœud de progression importé (déjà vérifié et corrigé par l'enseignant). */
+export type ImportedNode = {
+  ref: string;
+  parentRef: string | null;
+  kind: "domain" | "competency" | "unit" | "lesson";
+  label: string | null;
+  title: string;
+  objectives: string[];
+  activities: string[];
+  assessments: string[];
+  prerequisites: string[];
+  term: number | null;
+  period: string | null;
+  week: number | null;
+  durationMin: number | null;
+  isAssessment: boolean;
+};
+
+/**
+ * Enregistre une progression importée AVEC sa hiérarchie (domaines, compétences, séquences/unités, leçons).
+ * Ce qui vient du document est gardé tel quel : la leçon officielle rapprochée ne sert qu'à retrouver la
+ * bibliothèque, et ses objectifs ne complètent la leçon que si le document n'en donne aucun.
+ * Comme `saveTeacherCurriculum`, l'ancienne progression est retirée (pas effacée) et le futur replanifié.
+ */
+export async function saveImportedCurriculum(o: {
+  teacherId: string;
+  classLevel: string;
+  subjectCode: string;
+  nodes: ImportedNode[];
+  startAt: number;
+  today: string;
+  importId: string;
+}) {
+  const { teacherId, classLevel, subjectCode } = o;
+  const official = await CurriculumNode.find({ ownerId: null, classLevel, subjectCode, kind: "lesson", status: { $ne: "retired" } })
+    .select("_id title objectives durationMin")
+    .lean();
+  await CurriculumNode.updateMany({ ownerId: teacherId, classLevel, subjectCode, status: { $ne: "retired" } }, { status: "retired" });
+  const subsystem = subsystemOf(classLevel as ClassLevel);
+  const idByRef = new Map<string, Types.ObjectId>();
+  const titleById: { id: Types.ObjectId; title: string }[] = [];
+  let lessonIndex = 0;
+  let matched = 0;
+  const docs = o.nodes.map((n, i) => {
+    const _id = new Types.ObjectId();
+    idByRef.set(n.ref, _id);
+    const isLesson = n.kind === "lesson";
+    const match = isLesson ? bestMatch(official, n.title)?.node ?? null : null;
+    if (match) matched++;
+    const position = isLesson ? lessonIndex++ : -1;
+    if (isLesson) titleById.push({ id: _id, title: n.title });
+    return {
+      _id,
+      ownerId: new Types.ObjectId(teacherId),
+      subsystem,
+      classLevel,
+      subjectCode,
+      kind: n.kind,
+      parentRef: n.parentRef,
+      label: n.label ?? undefined,
+      title: n.title,
+      objectives: n.objectives.length ? n.objectives : match?.objectives ?? [],
+      activities: n.activities.length ? n.activities : undefined,
+      assessments: n.assessments.length ? n.assessments : undefined,
+      prerequisiteNotes: n.prerequisites.length ? n.prerequisites : undefined,
+      durationMin: n.durationMin ?? match?.durationMin ?? 45,
+      durationStated: n.durationMin != null,
+      order: isLesson ? position + 1 : i + 1,
+      term: n.term ?? undefined,
+      period: n.period ?? undefined,
+      week: n.week ?? undefined,
+      priority: n.isAssessment || /r[ée]vision|evaluation|évaluation|composition|revision|assessment/i.test(n.title) ? 3 : 2,
+      matchedNodeId: match?._id,
+      alreadyTaught: isLesson && position < o.startAt,
+      curriculumVersion: "enseignant",
+      status: "validated",
+      importId: new Types.ObjectId(o.importId),
+    };
+  });
+  // Parents et prérequis résolus une fois tous les identifiants connus (prérequis cités par leur titre).
+  const rows = docs.map(({ parentRef, prerequisiteNotes, ...d }) => ({
+    ...d,
+    prerequisiteNotes,
+    parentId: parentRef ? idByRef.get(parentRef) : undefined,
+    prerequisites: (prerequisiteNotes ?? []).flatMap((t) => {
+      const m = bestMatch(titleById, t, 0.6);
+      return m && !m.node.id.equals(d._id) ? [m.node.id] : [];
+    }),
+  }));
+  if (rows.length) await CurriculumNode.insertMany(rows);
+  await LessonInstance.deleteMany({ teacherId, classLevel, subjectCode, date: { $gt: o.today }, status: "planned", origin: "plan" });
+  await Timetable.updateMany({ teacherId, classLevel }, { $unset: { plannedFrom: 1, plannedThrough: 1 } });
+  return { count: lessonIndex, nodes: rows.length, matched };
 }
 
 /** Revient au programme officiel pour une matière. */

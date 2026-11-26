@@ -5,14 +5,14 @@ import { verifyAccessToken } from "../utils/jwt.js";
 
 const f = createUploadthing();
 
-/** Seuls les relecteurs et administrateurs envoient des fichiers (sources, illustrations). */
+/** Seuls les administrateurs envoient des fichiers (sources, illustrations). */
 async function staffOnly({ req }: { req: { headers: { authorization?: string | string[] } } }) {
   const raw = req.headers.authorization;
   const header = Array.isArray(raw) ? raw[0] : raw;
   const token = header?.startsWith("Bearer ") ? header.slice(7) : null;
   if (!token) throw new UploadThingError("Non authentifié");
   const payload = verifyAccessToken(token);
-  if (payload.role !== "admin" && payload.role !== "reviewer") throw new UploadThingError("Accès refusé");
+  if (payload.role !== "admin") throw new UploadThingError("Accès refusé");
   const session = await Session.exists({ _id: payload.sid, revokedAt: null });
   if (!session) throw new UploadThingError("Session expirée");
   return { userId: payload.sub };

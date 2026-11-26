@@ -28,9 +28,14 @@ const generatedDocumentSchema = new Schema(
     url: { type: String, required: true },
     key: { type: String, required: true },
     sizeBytes: Number,
+    format: { type: String, enum: ["pdf", "docx"] },
+    /** Empreinte du contenu et des réglages : la fiche prête est réutilisée tant qu'elle ne change pas. */
+    fingerprint: String,
+    adaptation: String,
   },
   { timestamps: true }
 );
+generatedDocumentSchema.index({ teacherId: 1, lessonId: 1, fingerprint: 1 });
 export const GeneratedDocument = mongoose.model("GeneratedDocument", generatedDocumentSchema);
 
 /**
@@ -41,7 +46,7 @@ const teacherUploadSchema = new Schema(
   {
     teacherId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
     // « figure » : image recadrée sur une fiche importée (logo, armoiries, dessin), réutilisée par l'aperçu et le PDF.
-    kind: { type: String, enum: ["prep", "curriculum", "figure"], required: true },
+    kind: { type: String, enum: ["prep", "curriculum", "figure", "import"], required: true },
     url: { type: String, required: true },
     key: { type: String, required: true },
     name: { type: String, maxlength: 200 },

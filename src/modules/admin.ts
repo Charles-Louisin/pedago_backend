@@ -36,7 +36,7 @@ import { env } from "../config/env.js";
 import { isAllowedHost, isUploadThingUrl } from "../ai/safe-fetch.js";
 
 export const adminRouter = Router();
-adminRouter.use(requireAuth, requireRole("reviewer", "admin"));
+adminRouter.use(requireAuth, requireRole("admin"));
 
 const me = (req: unknown) => req as AuthedRequest;
 const objectId = z.string().regex(/^[a-f\d]{24}$/i);
@@ -294,11 +294,14 @@ adminRouter.get(
       classLevel: z.enum(ALL_CLASS_LEVELS).optional(),
       subjectCode: z.string().optional(),
       type: z.enum(RESOURCE_TYPES).optional(),
+      /** Recherche dans le titre (texte littéral, jamais une expression régulière fournie par le client). */
+      q: z.string().trim().max(80).optional(),
     }),
     "query"
   ),
   ah(async (req, res) => {
-    const { page, limit, ...filter } = req.query as any;
+    const { page, limit, q, ...filter } = req.query as any;
+    if (q) filter.title = { $regex: String(q).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), $options: "i" };
     const [items, total] = await Promise.all([
       Resource.find(filter)
         .select("-content")
@@ -435,17 +438,13 @@ adminRouter.post(
     const to = req.body.to as ResourceStatus;
     const from = r.status as ResourceStatus;
     if (!STATUS_TRANSITIONS[from].includes(to)) throw badRequest("BAD_TRANSITION", `Transition ${from} → ${to} interdite`);
-    if ((to === "PUBLISHED" || to === "ARCHIVED") && me(req).role !== "admin") throw forbidden("ADMIN_ONLY", "Seul un administrateur publie ou archive");
     // Valider, c'est avoir vu le document tel qu'il sera diffusé : le PDF de CETTE version, ouvert par CETTE personne.
     if (to === "APPROVED" || to === "PUBLISHED") {
       const seen = await AuditLog.exists({ actorId: me(req).userId, action: "resource.pdf_view", target: String(r._id), "meta.version": r.contentVersion });
       if (!seen) throw badRequest("PDF_NOT_REVIEWED", "Affiche le PDF de la version en cours avant de valider");
     }
     if (to === "APPROVED") {
-      // Principe des quatre yeux : on ne valide pas son propre travail.
-      if (r.lastEditedBy && String(r.lastEditedBy) === me(req).userId) {
-        throw forbidden("SELF_APPROVAL", "Une autre personne doit valider cette ressource");
-      }
+      // L'administrateur est le relecteur humain : il valide après avoir lu le PDF de cette version (contrôle ci-dessus).
       const blocking = deterministicChecks(lessonContentSchema.parse(r.content)).filter((i) => i.severity === "error");
       if (blocking.length) throw badRequest("CHECKS_FAILED", blocking.map((b) => b.message).join(" · "));
       if (!r.sources.length && r.origin === "ai") throw badRequest("NO_SOURCE", "Une ressource IA doit citer au moins une source");
@@ -491,6 +490,100 @@ adminRouter.post(
       contentVersion: r.contentVersion,
     });
     res.status(201).json(review);
+  })
+);
+
+/* ───────────── Construire ma bibliothèque (analyse sans dépense IA) ───────────── */
+
+const planSchema = z.object({
+  subsystem: z.enum(["francophone", "anglophone"]),
+  classLevel: z.enum(ALL_CLASS_LEVELS as unknown as [string, ...string[]]),
+  source: z.enum(["research", "imported"]).default("imported"),
+  referenceYear: z.string().regex(/^\d{4}(-\d{4})?$/).optional(),
+  types: z.array(z.enum(RESOURCE_TYPES)).min(1).max(6).default(["lesson_plan", "exercises", "assessment"]),
+  difficulties: z.array(z.enum(DIFFICULTIES)).min(1).max(3).default(["standard"]),
+  term: z.number().int().min(1).max(3).optional(),
+  perJobBudgetUsd: z.number().min(0.05).max(10).default(0.5),
+});
+
+/**
+ * Analyse préalable d'une classe entière : documents, sources, matières, compétences, ressources et coût prévus,
+ * points à vérifier. Lecture seule de la base : aucun appel IA, aucune dépense.
+ */
+adminRouter.post(
+  "/library/plan",
+  validate(planSchema),
+  ah(async (req, res) => {
+    const p = req.body as z.infer<typeof planSchema>;
+    const base: Record<string, unknown> = { classLevel: p.classLevel, ownerId: null };
+    if (p.term) base.term = p.term;
+    const [lessons, pendingLessons, competencies, subjects] = await Promise.all([
+      CurriculumNode.find({ ...base, kind: "lesson", status: "validated" }).select("subjectCode objectives sourceRefs curriculumVersion").lean(),
+      CurriculumNode.countDocuments({ ...base, kind: "lesson", status: "extracted" }),
+      CurriculumNode.countDocuments({ ...base, kind: "competency", status: { $ne: "retired" } }),
+      Subject.find({ subsystem: p.subsystem }).select("code name").lean(),
+    ]);
+    const sourceIds = [...new Set(lessons.flatMap((l) => (l.sourceRefs ?? []).map((r) => String(r.sourceId))).filter(Boolean))];
+    const docs = await SourceDocument.find(sourceIds.length ? { _id: { $in: sourceIds } } : { _id: null }).select("title issuer status docType publishedOn").lean();
+    const allSources = await SourceDocument.aggregate<{ _id: string; n: number }>([{ $group: { _id: "$status", n: { $sum: 1 } } }]);
+
+    // Ressources déjà présentes (jamais régénérées) et ressources à produire.
+    const nodeIds = lessons.map((l) => l._id);
+    const existing = await Resource.find({ nodeId: { $in: nodeIds }, type: { $in: p.types }, status: { $nin: ["REJECTED", "ARCHIVED"] }, illustrationLevel: "simple" }).select("nodeId type difficulty illustrations").lean();
+    const have = new Set(existing.map((r) => `${r.nodeId}|${r.type}|${r.difficulty}`));
+    const bySubject = new Map<string, { lessons: number; objectives: number; planned: number; existing: number }>();
+    let planned = 0;
+    for (const l of lessons) {
+      const row = bySubject.get(l.subjectCode) ?? { lessons: 0, objectives: 0, planned: 0, existing: 0 };
+      row.lessons++;
+      row.objectives += l.objectives?.length ?? 0;
+      for (const t of p.types)
+        for (const d of p.difficulties) {
+          if (have.has(`${l._id}|${t}|${d}`)) row.existing++;
+          else {
+            row.planned++;
+            planned++;
+          }
+        }
+      bySubject.set(l.subjectCode, row);
+    }
+    const capped = Math.min(planned, env.aiMaxJobsPerBuild);
+
+    // Coût : moyenne réelle des générations passées ; sinon seul le plafond est connu.
+    const past = await AiJob.aggregate<{ avg: number; n: number }>([
+      { $match: { kind: "generate_resource", status: { $in: ["done", "waiting_review"] }, spentUsd: { $gt: 0 } } },
+      { $sort: { createdAt: -1 } },
+      { $limit: 200 },
+      { $group: { _id: null, avg: { $avg: "$spentUsd" }, n: { $sum: 1 } } },
+    ]);
+    const avg = past[0]?.n ? past[0].avg : null;
+    const illustrationsReady = existing.reduce((n, r) => n + (r.illustrations?.length ?? 0), 0);
+
+    const names = new Map(subjects.map((x) => [x.code, x.name]));
+    const checks: { level: "warn" | "info"; text: string }[] = [];
+    const missing = subjects.filter((x) => !bySubject.has(x.code));
+    if (!lessons.length) checks.push({ level: "warn", text: "Aucune leçon validée pour cette classe : importe ou extrais d'abord le programme officiel (Sources), puis valide-le (Référentiel)." });
+    if (missing.length && lessons.length) checks.push({ level: "warn", text: `Matières sans leçon validée : ${missing.map((x) => x.name).join(", ")}.` });
+    if (pendingLessons) checks.push({ level: "warn", text: `${pendingLessons} leçon(s) extraite(s) attendent ta validation dans le Référentiel (non comptées).` });
+    const unverified = docs.filter((d) => d.status !== "verified");
+    if (unverified.length) checks.push({ level: "warn", text: `${unverified.length} document(s) source non vérifié(s) : vérifie-les avant de publier.` });
+    if (planned > capped) checks.push({ level: "info", text: `Plafond de ${env.aiMaxJobsPerBuild} générations par lancement : relance une fois le premier lot terminé.` });
+    if (p.source === "research") checks.push({ level: "info", text: "Recherche autonome : les documents trouvés restent « à vérifier » dans Sources ; rien n'est utilisé sans ta validation." });
+    checks.push({ level: "info", text: "Illustrations : celles des ressources existantes sont réutilisées ; la génération d'images de la bibliothèque n'est pas encore branchée (aucune prévue)." });
+    if (avg === null) checks.push({ level: "info", text: "Pas encore d'historique de génération : seul le coût maximal est connu." });
+
+    res.json({
+      documents: docs.map((d) => ({ id: d._id, title: d.title, issuer: d.issuer, status: d.status, docType: d.docType, publishedOn: d.publishedOn ?? null })),
+      sources: { verified: allSources.find((x) => x._id === "verified")?.n ?? 0, toVerify: allSources.filter((x) => x._id !== "verified" && x._id !== "rejected").reduce((n, x) => n + x.n, 0) },
+      subjects: [...bySubject.entries()].map(([code, r]) => ({ code, name: names.get(code) ?? code, ...r })).sort((a, b) => a.name.localeCompare(b.name)),
+      missingSubjects: missing.map((x) => ({ code: x.code, name: x.name })),
+      competencies: { nodes: competencies, objectives: lessons.reduce((n, l) => n + (l.objectives?.length ?? 0), 0), lessons: lessons.length },
+      resources: { planned, launchable: capped, existing: existing.length },
+      illustrations: { planned: 0, reusable: illustrationsReady },
+      cost: { avgPerResourceUsd: avg, estimateUsd: avg === null ? null : Math.round(avg * capped * 100) / 100, maxUsd: Math.round(p.perJobBudgetUsd * capped * 100) / 100, basedOn: past[0]?.n ?? 0 },
+      checks,
+      referenceYear: p.referenceYear ?? null,
+    });
   })
 );
 
@@ -613,7 +706,7 @@ adminRouter.put(
 adminRouter.get(
   "/users",
   requireRole("admin"),
-  validate(pageQuery.extend({ role: z.enum(["teacher", "reviewer", "admin"]).optional() }), "query"),
+  validate(pageQuery.extend({ role: z.enum(["teacher", "admin"]).optional() }), "query"),
   ah(async (req, res) => {
     const { page, limit, role } = req.query as any;
     const filter = role ? { role } : {};
@@ -628,7 +721,7 @@ adminRouter.get(
 adminRouter.patch(
   "/users/:id",
   requireRole("admin"),
-  validate(z.object({ role: z.enum(["teacher", "reviewer", "admin"]).optional(), disabled: z.boolean().optional(), resetMfa: z.literal(true).optional() })),
+  validate(z.object({ role: z.enum(["teacher", "admin"]).optional(), disabled: z.boolean().optional(), resetMfa: z.literal(true).optional() })),
   ah(async (req, res) => {
     if (req.params.id === me(req).userId) throw badRequest("SELF_EDIT", "Tu ne peux pas modifier ton propre rôle");
     const { resetMfa, ...patch } = req.body as { role?: string; disabled?: boolean; resetMfa?: true };

@@ -1,6 +1,6 @@
 import mongoose, { Schema } from "mongoose";
 
-export const AI_JOB_KINDS = ["build_library", "generate_resource", "review_resource", "extract_source", "teacher_import", "research_sources"] as const;
+export const AI_JOB_KINDS = ["build_library", "generate_resource", "review_resource", "extract_source", "teacher_import", "research_sources", "program_import", "teacher_illustration"] as const;
 export type AiJobKind = (typeof AI_JOB_KINDS)[number];
 
 /**

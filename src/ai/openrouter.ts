@@ -101,3 +101,56 @@ export function parseJson<T = unknown>(text: string): T {
   if (start === -1 || end === -1) throw new Error("Aucun JSON dans la réponse");
   return JSON.parse(raw.slice(start, end + 1)) as T;
 }
+
+/**
+ * Génération d'image (illustration d'une fiche) : mêmes garde-fous que `chat` (budget de la tâche,
+ * plafond quotidien, journal). Renvoie l'image (PNG/JPEG) en binaire.
+ */
+export async function generateImage(input: { jobId: string; step: string; model: string; promptVersion: string; prompt: string; images?: string[] }) {
+  if (!env.openrouterApiKey) throw new AiNotConfiguredError("OPENROUTER_API_KEY manquant");
+  const job = await AiJob.findById(input.jobId).select("budgetUsd spentUsd").lean();
+  if (!job) throw new Error("Tâche IA introuvable");
+  if (job.spentUsd >= job.budgetUsd) throw new BudgetExceededError(`Budget atteint (${job.spentUsd.toFixed(3)} $)`);
+  const since = new Date(Date.now() - 86_400_000);
+  const [day] = await AiUsageLog.aggregate([{ $match: { createdAt: { $gte: since } } }, { $group: { _id: null, cost: { $sum: "$costUsd" } } }]);
+  if ((day?.cost ?? 0) >= env.aiDailyBudgetUsd) throw new BudgetExceededError(`Plafond quotidien atteint (${env.aiDailyBudgetUsd} $ sur 24 h)`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), env.aiRequestTimeoutMs);
+  const started = Date.now();
+  let log: Record<string, unknown> = { jobId: input.jobId, step: input.step, model: input.model, promptVersion: input.promptVersion };
+  try {
+    const res = await fetch(`${env.openrouterBaseUrl}/chat/completions`, {
+      method: "POST",
+      signal: controller.signal,
+      headers: { Authorization: `Bearer ${env.openrouterApiKey}`, "Content-Type": "application/json", "X-Title": "PEDAGO" },
+      body: JSON.stringify({
+        model: input.model,
+        modalities: ["image", "text"],
+        messages: [
+          {
+            role: "user",
+            content: input.images?.length ? [{ type: "text", text: input.prompt }, ...input.images.map((url) => ({ type: "image_url", image_url: { url } }))] : input.prompt,
+          },
+        ],
+        usage: { include: true },
+        provider: { data_collection: "deny", allow_fallbacks: true },
+      }),
+    });
+    const body = (await res.json().catch(() => ({}))) as any;
+    if (!res.ok) throw new Error(`OpenRouter ${res.status}: ${body?.error?.message ?? "erreur"}`);
+    const usage = body.usage ?? {};
+    const cost = Number(usage.cost ?? 0);
+    log = { ...log, provider: body.provider, tokensIn: usage.prompt_tokens ?? 0, tokensOut: usage.completion_tokens ?? 0, costUsd: cost, ok: true };
+    await AiJob.updateOne({ _id: input.jobId }, { $inc: { spentUsd: cost, tokensIn: usage.prompt_tokens ?? 0, tokensOut: usage.completion_tokens ?? 0 } });
+    const url: string | undefined = body.choices?.[0]?.message?.images?.[0]?.image_url?.url;
+    const m = url?.match(/^data:(image\/(?:png|jpeg|webp));base64,(.+)$/);
+    if (!m) throw new Error("Aucune image dans la réponse du modèle");
+    return { mime: m[1], data: Buffer.from(m[2], "base64"), cost };
+  } catch (err) {
+    log = { ...log, ok: false, error: (err as Error).message.slice(0, 500) };
+    throw err;
+  } finally {
+    clearTimeout(timer);
+    await AiUsageLog.create({ ...log, latencyMs: Date.now() - started }).catch(() => undefined);
+  }
+}

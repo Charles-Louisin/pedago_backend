@@ -11,7 +11,7 @@
     "start:worker": "node dist/worker.js",
     "seed": "tsx scripts/seed.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "node --import tsx --test --test-concurrency=1 test/*.test.ts",
+    "test": "node --import tsx --import ./test/helpers/offline-env.ts --test --test-concurrency=1 test/*.test.ts",
     "start:cluster": "node dist/cluster.js",
     "backup": "tsx scripts/backup.ts",
     "restore": "tsx scripts/restore.ts",

@@ -103,25 +103,21 @@ test("synchronisation idempotente : un même opId n'est appliqué qu'une fois", 
   assert.equal(catchup.body.filter((c: { title: string }) => c.title === lesson.node.title).length, 1);
 });
 
-test("principe des quatre yeux et publication réservée à l'admin", async () => {
+test("relecture par l'administrateur : PDF lu avant de valider, enseignant exclu", async () => {
   const admin = await staffToken("admin@pedago.test", "Pedago-Admin-2026!");
-  const reviewer = await staffToken("relecteur@pedago.test", "Pedago-Relecteur-2026!");
+  const teacher = (await login("enseignant@pedago.test", "Pedago-Enseignant-2026!")).body.accessToken;
   const r = await Resource.findOne({ status: "PUBLISHED" });
   const id = String(r!._id);
   const viewPdf = (token: string) => fetch(`${base}/api/v1/admin/resources/${id}/pdf`, { headers: { Authorization: `Bearer ${token}` } }).then((x) => x.arrayBuffer());
-  assert.equal((await call(`/admin/resources/${id}/revise`, { method: "POST", token: reviewer })).status, 403);
+  assert.equal((await call(`/admin/resources/${id}/revise`, { method: "POST", token: teacher })).status, 403);
   assert.equal((await call(`/admin/resources/${id}/revise`, { method: "POST", token: admin })).status, 200);
   // Sans avoir affiché le PDF de la nouvelle version, pas de validation.
-  const blind = await call(`/admin/resources/${id}/transition`, { method: "POST", token: reviewer, body: { to: "APPROVED" } });
+  const blind = await call(`/admin/resources/${id}/transition`, { method: "POST", token: admin, body: { to: "APPROVED" } });
   assert.equal(blind.status, 400);
   assert.equal(blind.body.code, "PDF_NOT_REVIEWED");
-  await viewPdf(reviewer);
   await viewPdf(admin);
-  // L'auteur de la révision ne peut pas l'approuver lui-même.
-  const self = await call(`/admin/resources/${id}/transition`, { method: "POST", token: admin, body: { to: "APPROVED" } });
-  assert.equal(self.status, 403);
-  assert.equal((await call(`/admin/resources/${id}/transition`, { method: "POST", token: reviewer, body: { to: "APPROVED" } })).status, 200);
-  assert.equal((await call(`/admin/resources/${id}/transition`, { method: "POST", token: reviewer, body: { to: "PUBLISHED" } })).status, 403);
+  // L'administrateur est le relecteur humain : il valide puis publie.
+  assert.equal((await call(`/admin/resources/${id}/transition`, { method: "POST", token: admin, body: { to: "APPROVED" } })).status, 200);
   assert.equal((await call(`/admin/resources/${id}/transition`, { method: "POST", token: admin, body: { to: "PUBLISHED" } })).status, 200);
 });
 

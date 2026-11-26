@@ -14,7 +14,7 @@ export const errorHandler: ErrorRequestHandler = (err, req, res, _next) => {
   }
   if (err instanceof HttpError) {
     if (err.statusCode >= 500) logger.error({ err }, "HttpError");
-    return res.status(err.statusCode).json({ statusCode: err.statusCode, code: err.code, message: err.message });
+    return res.status(err.statusCode).json({ statusCode: err.statusCode, code: err.code, message: err.message, ...(err.details !== undefined ? { details: err.details } : {}) });
   }
   const name = err?.name as string | undefined;
   if (name === "JsonWebTokenError" || name === "TokenExpiredError" || name === "NotBeforeError") {

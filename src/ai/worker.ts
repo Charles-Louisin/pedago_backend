@@ -4,15 +4,20 @@ import { AiJob } from "../models/index.js";
 import { logger } from "../utils/logger.js";
 import { AiNotConfiguredError, BudgetExceededError } from "./openrouter.js";
 import { runJob } from "./pipeline.js";
+import { programImportSettled } from "../services/program-import.js";
 
 const WORKER_ID = `${os.hostname()}-${process.pid}`;
 const LOCK_MS = 10 * 60 * 1000;
 
-/** Réserve atomiquement une tâche prête : plusieurs workers peuvent tourner sans double traitement. */
-async function claim() {
+/**
+ * Réserve atomiquement une tâche prête (ou une tâche précise) : plusieurs workers et l'API
+ * peuvent tourner sans double traitement.
+ */
+async function claim(jobId?: string) {
   const now = new Date();
   return AiJob.findOneAndUpdate(
     {
+      ...(jobId ? { _id: jobId } : {}),
       status: { $in: ["queued", "running"] },
       nextRunAt: { $lte: now },
       $or: [{ lockedUntil: null }, { lockedUntil: { $lt: now } }],
@@ -22,12 +27,13 @@ async function claim() {
   );
 }
 
-async function processOne() {
-  const job = await claim();
-  if (!job) return false;
+/** Exécute une tâche réservée ; en cas d'échec : nouvelle tentative temporisée, ou échec définitif. */
+async function execute(job: InstanceType<typeof AiJob>) {
+  let failure: unknown = null;
   try {
     await runJob(job);
   } catch (err) {
+    failure = err;
     const message = (err as Error).message?.slice(0, 1000) ?? "Erreur";
     const step = job.steps[job.currentStep];
     if (step) {
@@ -39,7 +45,8 @@ async function processOne() {
       job.status = "budget_exceeded";
     } else if (err instanceof AiNotConfiguredError) {
       job.status = "failed";
-    } else if ((step?.attempts ?? 0) >= job.maxAttempts) {
+    } else if ((step?.attempts ?? 0) >= job.maxAttempts || (err as { statusCode?: number }).statusCode === 422 || (err as { statusCode?: number }).statusCode === 415) {
+      // Document illisible : réessayer ne changerait rien.
       job.status = "failed";
     } else {
       // Nouvelle tentative avec temporisation exponentielle, à partir de l'étape échouée.
@@ -53,7 +60,24 @@ async function processOne() {
     job.lockedUntil = undefined;
     await job.save();
   }
+  if (failure) await programImportSettled(job, failure).catch((err) => logger.error({ err }, "Import : mise à jour après échec"));
+}
+
+async function processOne() {
+  const job = await claim();
+  if (!job) return false;
+  await execute(job);
   return true;
+}
+
+/**
+ * Lance tout de suite une tâche précise dans ce processus (import de l'enseignant : pas d'attente du prochain tour).
+ * Si le processus s'arrête en route, le verrou expire et un worker reprend la tâche à l'étape en cours.
+ */
+export function runJobNow(jobId: string) {
+  void claim(jobId)
+    .then((job) => (job ? execute(job) : undefined))
+    .catch((err) => logger.error({ err, jobId }, "Tâche IA lancée immédiatement"));
 }
 
 export function startAiWorker() {

@@ -50,7 +50,17 @@ export const env = {
   aiModelExtract: str("AI_MODEL_EXTRACT", "google/gemini-2.5-flash"),
   aiModelWrite: str("AI_MODEL_WRITE", "anthropic/claude-sonnet-4.5"),
   aiModelReview: str("AI_MODEL_REVIEW", "openai/gpt-5-mini"),
+  /** Illustrations des fiches (image générée, sans texte dedans). */
+  aiModelImage: str("AI_MODEL_IMAGE", "google/gemini-2.5-flash-image"),
+  /** Notifications push : service d'Expo (jeton d'accès facultatif, « Enhanced security » du projet EAS). */
+  expoPushUrl: str("EXPO_PUSH_URL", "https://exp.host/--/api/v2/push/send"),
+  expoPushToken: str("EXPO_ACCESS_TOKEN", ""),
+  /** Fuseau des écoles pour les rappels (heure des cours). */
+  schoolTimeZone: str("SCHOOL_TIME_ZONE", "Africa/Douala"),
+  remindersInProcess: bool("REMINDERS_IN_PROCESS", true),
   aiJobDefaultBudgetUsd: num("AI_JOB_DEFAULT_BUDGET_USD", 2),
+  /** Plafond de dépense d'un import « Mon programme » (classement + lectures de tous ses documents). */
+  aiImportBudgetUsd: num("AI_IMPORT_BUDGET_USD", 0.5),
   /** Plafond global de dépense IA sur 24 h glissantes (toutes tâches confondues). */
   aiDailyBudgetUsd: num("AI_DAILY_BUDGET_USD", 20),
   /** Nombre maximal de générations créées par une production « bibliothèque ». */

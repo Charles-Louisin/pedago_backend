@@ -5,3 +5,6 @@ export * from "./resource.js";
 export * from "./planning.js";
 export * from "./ai.js";
 export * from "./prep.js";
+export * from "./teacher-import.js";
+export * from "./notification.js";
+export * from "./site-media.js";

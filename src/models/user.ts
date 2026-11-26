@@ -6,7 +6,8 @@ const userSchema = new Schema(
     email: { type: String, trim: true, lowercase: true, maxlength: 160 },
     phone: { type: String, trim: true, maxlength: 32 },
     passwordHash: { type: String, required: true, select: false },
-    role: { type: String, enum: ["teacher", "reviewer", "admin"], default: "teacher", index: true },
+    /** Deux rôles : l'enseignant, et l'administrateur (qui est aussi le relecteur humain des contenus). */
+    role: { type: String, enum: ["teacher", "admin"], default: "teacher", index: true },
     disabled: { type: Boolean, default: false },
     failedLogins: { type: Number, default: 0, select: false },
     lockedUntil: { type: Date, select: false },
@@ -75,6 +76,8 @@ const teacherProfileSchema = new Schema(
       illustrationLevel: { type: String, enum: ["simple", "standard", "detailed"], default: "simple" },
       wifiOnlyDownloads: { type: Boolean, default: false },
       lowInkExports: { type: Boolean, default: true },
+      /** Notifications push sur le téléphone (rappels de cours, bilan, fiches prêtes). */
+      pushReminders: { type: Boolean, default: true },
     },
     onboardingCompletedAt: Date,
   },

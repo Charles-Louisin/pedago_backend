@@ -9,6 +9,7 @@ import {
   Session,
   TeacherPrep,
   TeacherProfile,
+  TeacherImport,
   TeacherUpload,
   Timetable,
   User,
@@ -21,7 +22,7 @@ import { deleteStoredFile } from "./storage.js";
  */
 export async function exportAccount(userId: string) {
   const id = new Types.ObjectId(userId);
-  const [user, profile, timetables, lessons, events, catchups, preps, curriculum, documents, sessions, uploads] = await Promise.all([
+  const [user, profile, timetables, lessons, events, catchups, preps, curriculum, documents, sessions, uploads, imports] = await Promise.all([
     User.findById(id).select("fullName email phone role emailVerified createdAt lastLoginAt").lean(),
     TeacherProfile.findOne({ userId: id }).lean(),
     Timetable.find({ teacherId: id }).lean(),
@@ -33,6 +34,7 @@ export async function exportAccount(userId: string) {
     GeneratedDocument.find({ teacherId: id }).select("url sizeBytes createdAt").lean(),
     Session.find({ userId: id }).select("device createdAt lastUsedAt revokedAt").lean(),
     TeacherUpload.find({ teacherId: id }).select("kind url name mime sizeBytes createdAt").lean(),
+    TeacherImport.find({ teacherId: id }).select("classLevel schoolYear status files.name files.category extraction draft validatedAt createdAt").lean(),
   ]);
   return {
     exportedAt: new Date().toISOString(),
@@ -47,6 +49,7 @@ export async function exportAccount(userId: string) {
     catchUp: catchups,
     documents,
     uploads,
+    imports,
     sessions,
   };
 }
@@ -60,6 +63,7 @@ export async function deleteAccount(userId: string, ip?: string) {
   await Promise.all([
     GeneratedDocument.deleteMany({ teacherId: id }),
     TeacherUpload.deleteMany({ teacherId: id }),
+    TeacherImport.deleteMany({ teacherId: id }),
     TeacherPrep.deleteMany({ teacherId: id }),
     CatchUpItem.deleteMany({ teacherId: id }),
     ProgressEvent.deleteMany({ teacherId: id }),

@@ -48,17 +48,17 @@ const READ_MAX = 8 * 1024 * 1024;
  * Relit un fichier stocké (image d'une fiche pour le PDF) : seulement nos propres adresses (pas de
  * requête vers une adresse choisie par un client), 5 s et 8 Mo au plus, sans redirection.
  */
-export async function readStoredFile(url: string): Promise<Buffer | null> {
+export async function readStoredFile(url: string, max = READ_MAX): Promise<Buffer | null> {
   if (!isStoredUrl(url)) return null;
   if (url.startsWith(localBase())) {
     const data = await fs.readFile(path.join(LOCAL_DIR, path.basename(url.slice(localBase().length)))).catch(() => null);
-    return data && data.length <= READ_MAX ? data : null;
+    return data && data.length <= max ? data : null;
   }
   try {
     const res = await fetch(url, { redirect: "error", signal: AbortSignal.timeout(5000) });
-    if (!res.ok || Number(res.headers.get("content-length") ?? 0) > READ_MAX) return null;
+    if (!res.ok || Number(res.headers.get("content-length") ?? 0) > max) return null;
     const data = Buffer.from(await res.arrayBuffer());
-    return data.length <= READ_MAX ? data : null;
+    return data.length <= max ? data : null;
   } catch {
     return null;
   }

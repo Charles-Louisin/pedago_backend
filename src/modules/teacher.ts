@@ -17,12 +17,30 @@ import {
   TeacherUpload,
   Timetable,
   User,
+  Notification,
+  PushToken,
 } from "../models/index.js";
 import { requireAuth, requireVerifiedEmail, type AuthedRequest } from "../middleware/auth.js";
 import { validate } from "../middleware/validate.js";
-import { ah, badRequest, notFound } from "../utils/http-error.js";
+import { ah, badRequest, HttpError, notFound } from "../utils/http-error.js";
 import { addDays, isLocalDate, minutesBetween } from "../utils/dates.js";
-import { applyCatchUp, ensurePlan, proposeCatchUp } from "../services/planning.js";
+import { applyCatchUp, ensurePlan, proposeCatchUp, saveTimetableVersion } from "../services/planning.js";
+import {
+  cancelImport,
+  createProgramImport,
+  draftPatchSchema,
+  getImport,
+  importView,
+  listImports,
+  patchDraft,
+  PROGRAM_IMPORT_MAX_BYTES,
+  PROGRAM_IMPORT_MAX_FILES,
+  retryImport,
+  validateImport,
+} from "../services/program-import.js";
+import { runJobNow } from "../ai/worker.js";
+import { acceptLessonIllustration, createLessonIllustration, customizeLessonFile, discardIllustrationDraft, lessonFile, lessonFiles, lessonIllustration, postponeLesson, removeLessonIllustration } from "../services/lesson-files.js";
+import { AiNotConfiguredError, BudgetExceededError } from "../ai/openrouter.js";
 import { lessonsFor, parseProgression, resetTeacherCurriculum, saveTeacherCurriculum } from "../services/curriculum.js";
 import { buildLessonDocument, composeLessonDoc, previewOf, type ComposeOptions } from "../services/exports.js";
 import { prepLayoutSchema, type PrepLayout } from "../services/layout.js";
@@ -87,6 +105,7 @@ const profileSchema = z
         illustrationLevel: z.enum(["simple", "standard", "detailed"]).default("simple"),
         wifiOnlyDownloads: z.boolean().default(false),
         lowInkExports: z.boolean().default(true),
+        pushReminders: z.boolean().default(true),
       })
       .partial()
       .optional(),
@@ -127,33 +146,53 @@ teacherRouter.get(
 
 /* ───────────── Emploi du temps ───────────── */
 
-const timetableSchema = z.object({
-  classLevel: z.enum(ALL_CLASS_LEVELS),
-  slots: z
-    .array(
-      z.object({
-        weekday: z.number().int().min(1).max(6),
-        start: z.string().regex(/^\d{2}:\d{2}$/),
-        end: z.string().regex(/^\d{2}:\d{2}$/),
-        subjectCode: z.string().max(40),
-      })
-    )
-    .max(80)
-    .refine((slots) => slots.every((s) => minutesBetween(s.start, s.end) > 0), "Chaque créneau doit finir après son début")
-    .refine((slots) => {
-      for (const a of slots)
-        for (const b of slots)
-          if (a !== b && a.weekday === b.weekday && a.start < b.end && b.start < a.end) return false;
-      return true;
-    }, "Deux créneaux se chevauchent"),
-});
+const hhmm = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, "Heure attendue au format HH:MM");
+const noOverlap = (items: { weekday: number; start: string; end: string }[]) => {
+  for (const a of items) for (const b of items) if (a !== b && a.weekday === b.weekday && a.start < b.end && b.start < a.end) return false;
+  return true;
+};
+const timetableSchema = z
+  .object({
+    classLevel: z.enum(ALL_CLASS_LEVELS),
+    slots: z
+      .array(
+        z.object({
+          weekday: z.number().int().min(1).max(6),
+          start: hhmm,
+          end: hhmm,
+          subjectCode: z.string().max(40),
+          room: z.string().trim().max(80).nullish(),
+          label: z.string().trim().max(120).nullish(),
+        })
+      )
+      .max(80)
+      .refine((slots) => slots.every((s) => minutesBetween(s.start, s.end) > 0), "Chaque créneau doit finir après son début"),
+    /** Pauses et séances particulières : facultatives (gardées telles quelles si absentes). */
+    extras: z
+      .array(z.object({ weekday: z.number().int().min(1).max(6), start: hhmm, end: hhmm, kind: z.enum(["break", "special"]), label: z.string().trim().min(1).max(120) }))
+      .max(40)
+      .optional(),
+  })
+  .refine((t) => noOverlap([...t.slots, ...(t.extras ?? [])]), "Deux créneaux se chevauchent");
 
 teacherRouter.get(
   "/timetable/:classLevel",
   ah(async (req, res) => {
     const profile = await profileOf(uid(req));
     const tt = await Timetable.findOne({ teacherId: uid(req), classLevel: req.params.classLevel, schoolYear: profile.schoolYear }).lean();
-    res.json(tt ?? { classLevel: req.params.classLevel, slots: [], version: 0 });
+    if (!tt) return res.json({ classLevel: req.params.classLevel, slots: [], extras: [], version: 0, source: null, history: [] });
+    res.json({
+      classLevel: tt.classLevel,
+      schoolYear: tt.schoolYear,
+      version: tt.version,
+      source: tt.source ?? "manual",
+      importId: tt.importId ?? null,
+      slots: tt.slots,
+      extras: tt.extras ?? [],
+      updatedAt: tt.updatedAt,
+      // Historique résumé (les créneaux des anciennes versions restent dans l'export des données).
+      history: (tt.history ?? []).map((h) => ({ version: h.version, source: h.source, savedAt: h.savedAt, slots: h.slots?.length ?? 0 })).reverse(),
+    });
   })
 );
 
@@ -162,17 +201,131 @@ teacherRouter.put(
   validate(timetableSchema),
   ah(async (req, res) => {
     const profile = await profileOf(uid(req));
-    const { classLevel, slots } = req.body as z.infer<typeof timetableSchema>;
+    const { classLevel, slots, extras } = req.body as z.infer<typeof timetableSchema>;
     assertTeaches(profile, classLevel);
-    const tt = await Timetable.findOneAndUpdate(
-      { teacherId: uid(req), classLevel, schoolYear: profile.schoolYear },
-      { slots, $inc: { version: 1 }, $unset: { plannedFrom: 1, plannedThrough: 1 } },
-      { upsert: true, new: true }
-    ).lean();
-    // Les séances futures encore « prévues » sont recalculées avec le nouvel emploi du temps.
     const today = typeof req.query.today === "string" && isLocalDate(req.query.today) ? req.query.today : new Date().toISOString().slice(0, 10);
-    await LessonInstance.deleteMany({ teacherId: uid(req), classLevel, date: { $gt: today }, status: "planned", origin: "plan" });
+    const current = extras ? null : await Timetable.findOne({ teacherId: uid(req), classLevel, schoolYear: profile.schoolYear }).select("extras").lean();
+    // Nouvelle version (l'ancienne va dans l'historique) ; les séances futures « prévues » sont recalculées.
+    const tt = await saveTimetableVersion(
+      uid(req),
+      classLevel,
+      profile.schoolYear,
+      { slots: slots.map((s) => ({ ...s, room: s.room ?? null, label: s.label ?? null })), extras: extras ?? current?.extras ?? [], source: "manual" },
+      today
+    );
     res.json(tt);
+  })
+);
+
+/* ───────────── Importer mon programme (emploi du temps + curriculum) ───────────── */
+
+const programUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: PROGRAM_IMPORT_MAX_BYTES, files: PROGRAM_IMPORT_MAX_FILES, fields: 6, fieldSize: 4096 } });
+const declaredSchema = z.enum(["timetable", "curriculum", "auto"]);
+const importId = z.object({ id: z.string().regex(/^[a-f\d]{24}$/i, "Identifiant invalide") });
+const todayQuery = z.object({ today: localDate.optional() });
+const todayOf = (q: unknown) => (q as { today?: string }).today ?? new Date().toISOString().slice(0, 10);
+
+/**
+ * Envoi des documents (1 à 8 fichiers : photos, PDF, Word, Excel). Réponse immédiate (202) :
+ * la lecture se fait en arrière-plan, l'app suit l'avancement avec GET /program-imports/:id.
+ */
+teacherRouter.post(
+  "/program-imports",
+  (req, res, next) =>
+    programUpload.array("files", PROGRAM_IMPORT_MAX_FILES)(req, res, (err: unknown) => {
+      const code = (err as { code?: string } | undefined)?.code;
+      if (!err) return next();
+      if (code === "LIMIT_FILE_SIZE") return next(badRequest("FILE_TOO_LARGE", "Un fichier est trop lourd (10 Mo maximum)"));
+      if (code === "LIMIT_FILE_COUNT") return next(badRequest("TOO_MANY_FILES", `${PROGRAM_IMPORT_MAX_FILES} fichiers au plus par import`));
+      next(badRequest("UPLOAD_INVALID", "Envoi invalide"));
+    }),
+  ah(async (req, res) => {
+    const files = ((req as typeof req & { files?: Express.Multer.File[] }).files ?? []) as Express.Multer.File[];
+    const body = z
+      .object({
+        classLevel: z.enum(ALL_CLASS_LEVELS),
+        /** Catégorie annoncée pour chaque fichier, dans l'ordre (JSON), ou une seule pour tous. */
+        declared: z
+          .string()
+          .max(400)
+          .optional()
+          .transform((v, ctx) => {
+            if (!v) return [] as z.infer<typeof declaredSchema>[];
+            try {
+              const parsed = JSON.parse(v);
+              return z.array(declaredSchema).max(PROGRAM_IMPORT_MAX_FILES).parse(Array.isArray(parsed) ? parsed : [parsed]);
+            } catch {
+              const one = declaredSchema.safeParse(v);
+              if (one.success) return [one.data];
+              ctx.addIssue({ code: "custom", message: "Catégorie de document inconnue" });
+              return z.NEVER;
+            }
+          }),
+      })
+      .parse(req.body ?? {});
+    const profile = await profileOf(uid(req));
+    assertTeaches(profile, body.classLevel);
+    const { imp, jobId } = await createProgramImport({
+      teacherId: uid(req),
+      classLevel: body.classLevel,
+      schoolYear: profile.schoolYear,
+      files: files.map((f, i) => ({ buffer: f.buffer, name: Buffer.from(f.originalname, "latin1").toString("utf8") || `document-${i + 1}`, declared: body.declared[i] ?? body.declared[0] ?? "auto" })),
+    });
+    runJobNow(jobId);
+    res.status(202).json(await importView(imp, todayOf(req.query)));
+  })
+);
+
+teacherRouter.get(
+  "/program-imports",
+  ah(async (req, res) => {
+    res.json(await listImports(uid(req)));
+  })
+);
+
+teacherRouter.get(
+  "/program-imports/:id",
+  validate(importId, "params"),
+  validate(todayQuery, "query"),
+  ah(async (req, res) => {
+    res.set("Cache-Control", "no-store").json(await getImport(uid(req), String(req.params.id), todayOf(req.query)));
+  })
+);
+
+teacherRouter.patch(
+  "/program-imports/:id/draft",
+  validate(importId, "params"),
+  validate(todayQuery, "query"),
+  validate(draftPatchSchema),
+  ah(async (req, res) => {
+    res.json(await patchDraft(uid(req), String(req.params.id), req.body, todayOf(req.query)));
+  })
+);
+
+teacherRouter.post(
+  "/program-imports/:id/validate",
+  validate(importId, "params"),
+  validate(z.object({ today: localDate })),
+  ah(async (req, res) => {
+    res.json(await validateImport(uid(req), String(req.params.id), req.body.today));
+  })
+);
+
+teacherRouter.post(
+  "/program-imports/:id/retry",
+  validate(importId, "params"),
+  ah(async (req, res) => {
+    runJobNow(await retryImport(uid(req), String(req.params.id)));
+    res.status(202).json(await getImport(uid(req), String(req.params.id), todayOf(req.query)));
+  })
+);
+
+teacherRouter.delete(
+  "/program-imports/:id",
+  validate(importId, "params"),
+  ah(async (req, res) => {
+    await cancelImport(uid(req), String(req.params.id));
+    res.status(204).end();
   })
 );
 
@@ -681,6 +834,7 @@ teacherRouter.get(
       illustrationLevel: profile.preferences?.illustrationLevel ?? "simple",
       includeAnswers: true,
       defaultLayout: (profile.prepLayout as PrepLayout | null) ?? null,
+    lowInk: profile.preferences?.lowInkExports ?? true,
     });
     res.json({ ...previewOf(doc), usedPrep, usedLayout, adaptation: "not_needed", difficulty: "standard" });
   })
@@ -754,12 +908,176 @@ async function composeOptions(req: AuthedRequest, body: z.infer<typeof documentO
     teacherName: user?.fullName ?? "",
     schoolName: profile.schoolName ?? "",
     lesson,
-    difficulty: body.difficulty ?? profile.preferences?.difficulty ?? "standard",
-    illustrationLevel: body.illustrationLevel ?? profile.preferences?.illustrationLevel ?? "simple",
+    // Réglages propres à la séance (modifiée avec l'IA) d'abord, puis préférences du profil.
+    difficulty: body.difficulty ?? lesson.docOptions?.difficulty ?? profile.preferences?.difficulty ?? "standard",
+    illustrationLevel: body.illustrationLevel ?? lesson.docOptions?.illustrationLevel ?? profile.preferences?.illustrationLevel ?? "simple",
     includeAnswers: body.includeAnswers,
+    instruction: lesson.docOptions?.instruction ?? null,
+    illustration: lesson.docOptions?.illustration?.url ? { url: lesson.docOptions.illustration.url, aspect: lesson.docOptions.illustration.aspect } : null,
     defaultLayout: (profile.prepLayout as PrepLayout | null) ?? null,
   };
 }
+
+/* ───────────── Fiches prêtes des séances (téléchargement depuis chaque carte) ───────────── */
+
+/** État des fiches d'une plage : taille exacte quand elle est prête ; les 7 prochains jours se préparent seuls. */
+teacherRouter.get(
+  "/lessons/files",
+  validate(rangeSchema.extend({ today: localDate }), "query"),
+  ah(async (req, res) => {
+    const { from, to, today } = req.query as unknown as { from: string; to: string; today: string };
+    if (from > to || addDays(from, 62) < to) throw badRequest("BAD_RANGE", "Plage de dates invalide (62 jours maximum)");
+    res.set("Cache-Control", "no-store").json(await lessonFiles(uid(req), from, to, today));
+  })
+);
+
+const lessonIdParam = z.object({ lessonId: z.string().regex(/^[a-f\d]{24}$/i, "Identifiant invalide") });
+
+/** Fiche d'une séance : composée tout de suite si elle n'est pas encore prête. */
+teacherRouter.post(
+  "/lessons/:lessonId/file",
+  validate(lessonIdParam, "params"),
+  ah(async (req, res) => {
+    res.json(await lessonFile(uid(req), String(req.params.lessonId)));
+  })
+);
+
+/** Modifier la fiche de cette séance avec l'IA (niveau, illustrations, corrigés, demande libre) ou revenir au réglage du profil. */
+teacherRouter.put(
+  "/lessons/:lessonId/file/options",
+  validate(lessonIdParam, "params"),
+  validate(
+    z.object({
+      difficulty: z.enum(["easy", "standard", "advanced"]).optional(),
+      illustrationLevel: z.enum(["simple", "standard", "detailed"]).optional(),
+      includeAnswers: z.boolean().optional(),
+      instruction: z.string().trim().max(400).nullish(),
+      reset: z.boolean().optional(),
+    })
+  ),
+  ah(async (req, res) => {
+    res.json(await customizeLessonFile(uid(req), String(req.params.lessonId), req.body));
+  })
+);
+
+/* ───────────── Notifications (cloche et push) ───────────── */
+
+/** Enregistre le téléphone pour recevoir les notifications push (jeton Expo). */
+teacherRouter.post(
+  "/me/push-token",
+  validate(z.object({ token: z.string().regex(/^(Exponent|Expo)PushToken\[[\w-]+\]$/, "Jeton de notification invalide"), platform: z.enum(["android", "ios"]) })),
+  ah(async (req, res) => {
+    await PushToken.updateOne({ token: req.body.token }, { userId: uid(req), platform: req.body.platform }, { upsert: true });
+    res.status(204).end();
+  })
+);
+
+/** Ce téléphone ne reçoit plus de notifications (déconnexion). */
+teacherRouter.delete(
+  "/me/push-token",
+  validate(z.object({ token: z.string().max(200) })),
+  ah(async (req, res) => {
+    await PushToken.deleteOne({ token: req.body.token, userId: uid(req) });
+    res.status(204).end();
+  })
+);
+
+teacherRouter.get(
+  "/notifications",
+  ah(async (req, res) => {
+    const items = await Notification.find({ userId: uid(req) }).sort({ createdAt: -1 }).limit(60).select("key kind title body href readAt createdAt").lean();
+    res.json(items.map((n) => ({ id: String(n._id), key: n.key, kind: n.kind, title: n.title, body: n.body, href: n.href ?? null, read: !!n.readAt, at: n.createdAt })));
+  })
+);
+
+teacherRouter.post(
+  "/notifications/read",
+  ah(async (req, res) => {
+    await Notification.updateMany({ userId: uid(req), readAt: null }, { readAt: new Date() });
+    res.status(204).end();
+  })
+);
+
+teacherRouter.delete(
+  "/notifications",
+  ah(async (req, res) => {
+    await Notification.deleteMany({ userId: uid(req) });
+    res.status(204).end();
+  })
+);
+
+/** Illustration de la fiche : celle en place et les brouillons à valider. */
+teacherRouter.get(
+  "/lessons/:lessonId/illustration",
+  validate(lessonIdParam, "params"),
+  ah(async (req, res) => {
+    res.json(await lessonIllustration(uid(req), String(req.params.lessonId)));
+  })
+);
+
+/** Nouveau brouillon d'illustration (l'IA lit la leçon et l'image actuelle ; la fiche ne change pas avant validation). */
+teacherRouter.post(
+  "/lessons/:lessonId/illustration",
+  validate(lessonIdParam, "params"),
+  validate(
+    z.object({
+      kind: z.enum(["schema", "color", "bw", "photo", "map"]),
+      level: z.enum(["simple", "standard", "legend"]),
+      color: z.boolean().default(true),
+      legends: z.boolean().default(true),
+      description: z.string().trim().min(10, "Décris l'illustration en une ou deux phrases").max(600),
+      /** Retoucher ce brouillon plutôt que l'illustration actuelle. */
+      fromDraftId: z.string().regex(/^[a-f\d]{12}$/).optional(),
+    })
+  ),
+  ah(async (req, res) => {
+    try {
+      res.json(await createLessonIllustration(uid(req), String(req.params.lessonId), req.body));
+    } catch (err) {
+      if (err instanceof BudgetExceededError) throw new HttpError(503, "AI_BUDGET", "La création d'images est indisponible pour aujourd'hui. Réessaie demain.");
+      if (err instanceof AiNotConfiguredError) throw new HttpError(503, "AI_NOT_CONFIGURED", "La création d'images demande l'IA, pas encore activée.");
+      if (err instanceof HttpError) throw err;
+      throw new HttpError(502, "AI_FAILED", "L'illustration n'a pas pu être créée. Réessaie avec une description plus simple.");
+    }
+  })
+);
+
+const draftParam = z.object({ lessonId: z.string().regex(/^[a-f\d]{24}$/i), draftId: z.string().regex(/^[a-f\d]{12}$/) });
+
+/** Valider un brouillon : il entre dans la fiche (seule l'image change). */
+teacherRouter.post(
+  "/lessons/:lessonId/illustration/:draftId/accept",
+  validate(draftParam, "params"),
+  ah(async (req, res) => {
+    res.json(await acceptLessonIllustration(uid(req), String(req.params.lessonId), String(req.params.draftId)));
+  })
+);
+
+teacherRouter.delete(
+  "/lessons/:lessonId/illustration/:draftId",
+  validate(draftParam, "params"),
+  ah(async (req, res) => {
+    res.json(await discardIllustrationDraft(uid(req), String(req.params.lessonId), String(req.params.draftId)));
+  })
+);
+
+teacherRouter.delete(
+  "/lessons/:lessonId/illustration",
+  validate(lessonIdParam, "params"),
+  ah(async (req, res) => {
+    res.json(await removeLessonIllustration(uid(req), String(req.params.lessonId)));
+  })
+);
+
+/** Reporter une séance à une date ultérieure (sa leçon prend le premier créneau de la matière à partir de cette date). */
+teacherRouter.post(
+  "/lessons/:lessonId/postpone",
+  validate(lessonIdParam, "params"),
+  validate(z.object({ to: localDate, today: localDate })),
+  ah(async (req, res) => {
+    res.json(await postponeLesson(uid(req), String(req.params.lessonId), req.body.to, req.body.today));
+  })
+);
 
 /** Aperçu fidèle : les blocs exacts que le PDF dessinera, au niveau demandé (adapté par l'IA si besoin). */
 teacherRouter.post(

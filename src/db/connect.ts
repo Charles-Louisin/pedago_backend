@@ -35,6 +35,13 @@ export async function connectDb() {
     const { seedDatabase } = await import("../seed/seed.js");
     await seedDatabase();
   }
+  await migrateRoles();
+}
+
+/** Deux rôles seulement : les anciens comptes « relecteur » deviennent administrateurs (le relecteur est l'admin). */
+async function migrateRoles() {
+  const out = await mongoose.connection.collection("users").updateMany({ role: "reviewer" }, { $set: { role: "admin" } });
+  if (out.modifiedCount) logger.info({ count: out.modifiedCount }, "Comptes relecteur passés administrateur");
 }
 
 export async function disconnectDb() {

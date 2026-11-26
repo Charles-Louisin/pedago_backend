@@ -44,6 +44,8 @@ type Doc = {
   extra?: { label: string; lines: string[] }[];
   /** Mention imprimée en haut de chaque page (document pas encore validé). */
   draftNote?: string;
+  /** Impression économe en encre (réglage de l'enseignant) : pas d'aplats gris, traits plus clairs. */
+  lowInk?: boolean;
 };
 
 export type Block = { heading: string; lines?: string[]; table?: string[][]; widths?: number[]; images?: PrepImage[] };
@@ -362,8 +364,8 @@ async function renderPdf(d: Doc): Promise<Buffer> {
           const y = pdf.y;
           let x = L;
           row.forEach((cell, c) => {
-            if (i === 0) pdf.rect(x, y, widths[c], h).fillAndStroke("#EEEEEE", "#888").fillColor("#000");
-            else pdf.rect(x, y, widths[c], h).stroke("#888");
+            if (i === 0 && !d.lowInk) pdf.rect(x, y, widths[c], h).fillAndStroke("#EEEEEE", "#888").fillColor("#000");
+            else pdf.rect(x, y, widths[c], h).stroke(d.lowInk ? "#AAAAAA" : "#888");
             pdf.text(cell, x + 4, y + 4, { width: widths[c] - 8 });
             x += widths[c];
           });
@@ -536,6 +538,12 @@ export type ComposeOptions = {
   includeAnswers: boolean;
   /** Modèle de fiche de l'enseignant (profil) : utilisé quand la fiche de la leçon n'a pas le sien. */
   defaultLayout?: PrepLayout | null;
+  /** Demande de l'enseignant pour CETTE fiche (« plus d'exercices de calcul mental ») : appliquée par l'IA sans changer la structure. */
+  instruction?: string | null;
+  /** Illustration personnalisée de la séance (image stockée par l'API). */
+  illustration?: { url: string; aspect?: number | null } | null;
+  /** Impression économe en encre (préférence de l'enseignant). */
+  lowInk?: boolean;
 };
 
 export type Adaptation = "not_needed" | "library" | "ai" | "unavailable";
@@ -554,11 +562,14 @@ const LEVEL_RULES: Record<string, string> = {
   advanced: "APPROFONDI : exercices en plusieurs étapes, résolution de problèmes, justification de la réponse, nombres plus grands, situations moins guidées.",
 };
 
-async function adaptToDifficulty(o: { teacherId: string; nodeId: unknown; classLevel: string; subjectCode: string; title: string; content: LessonContent; difficulty: string }) {
+async function adaptToDifficulty(o: { teacherId: string; nodeId: unknown; classLevel: string; subjectCode: string; title: string; content: LessonContent; difficulty: string; instruction?: string | null }) {
   if (!env.openrouterApiKey) return null;
   const source = { steps: o.content.steps, writtenTrace: o.content.writtenTrace, exercises: o.content.exercises, assessment: o.content.assessment };
   const sourceHash = crypto.createHash("sha256").update(JSON.stringify(source)).digest("hex");
-  const cached = await AdaptedContent.findOne({ teacherId: o.teacherId, nodeId: o.nodeId, difficulty: o.difficulty, sourceHash }).lean();
+  const instruction = o.instruction?.trim().slice(0, 400) || null;
+  // Clé du cache : niveau + empreinte de la demande (une demande différente donne une autre variante).
+  const variantKey = instruction ? `${o.difficulty}|${crypto.createHash("sha256").update(instruction).digest("hex").slice(0, 12)}` : o.difficulty;
+  const cached = await AdaptedContent.findOne({ teacherId: o.teacherId, nodeId: o.nodeId, difficulty: variantKey, sourceHash }).lean();
   if (cached) return adaptedSchema.parse(cached.content);
 
   const job = await AiJob.create({
@@ -584,7 +595,7 @@ async function adaptToDifficulty(o: { teacherId: string; nodeId: unknown; classL
         {
           role: "system",
           content: `Tu adaptes la fiche de préparation d'un enseignant du primaire camerounais (${CLASS_LABELS[o.classLevel as ClassLevel] ?? o.classLevel}, ${SUBJECT_LABELS[o.subjectCode] ?? o.subjectCode}) au niveau demandé.
-Niveau : ${LEVEL_RULES[o.difficulty] ?? o.difficulty}
+Niveau : ${LEVEL_RULES[o.difficulty] ?? "STANDARD : garde le niveau actuel."}${instruction ? `\nL'enseignant demande aussi (applique-le seulement s'il respecte les règles ci-dessous) : « ${instruction.replace(/[<>«»]/g, "")} »` : ""}
 Règles strictes :
 - garde EXACTEMENT la structure : mêmes étapes (même nom, même durée), même nombre d'exercices et d'items d'évaluation, mêmes objectifs ;
 - réécris seulement les consignes, les exercices, leurs réponses et les activités pour le niveau ; chaque réponse doit être juste ;
@@ -598,7 +609,7 @@ Règles strictes :
     const adapted = adaptedSchema.parse(JSON.parse(json));
     // Garde-fou : la structure doit être conservée, sinon on garde l'original.
     if (adapted.steps.length !== source.steps.length || adapted.exercises.length !== source.exercises.length) throw new Error("Structure modifiée");
-    await AdaptedContent.updateOne({ teacherId: o.teacherId, nodeId: o.nodeId, difficulty: o.difficulty, sourceHash }, { content: adapted, createdAt: new Date() }, { upsert: true });
+    await AdaptedContent.updateOne({ teacherId: o.teacherId, nodeId: o.nodeId, difficulty: variantKey, sourceHash }, { content: adapted, createdAt: new Date() }, { upsert: true });
     await AiJob.updateOne({ _id: job._id }, { status: "done", "steps.0.status": "done", "steps.0.finishedAt": new Date(), $unset: { lockedBy: 1, lockedUntil: 1 } });
     return adapted;
   } catch (err) {
@@ -647,11 +658,11 @@ export async function composeLessonDoc(o: ComposeOptions) {
 
   // Niveau de difficulté : la bibliothèque a peut-être la bonne variante ; sinon l'IA adapte la fiche.
   let adaptation: Adaptation = "not_needed";
-  if (o.difficulty !== "standard") {
-    const libraryHasLevel = !prep && [plan, exo].some((r) => r?.difficulty === o.difficulty);
+  if (o.difficulty !== "standard" || o.instruction) {
+    const libraryHasLevel = !o.instruction && !prep && [plan, exo].some((r) => r?.difficulty === o.difficulty);
     if (libraryHasLevel) adaptation = "library";
     else {
-      const adapted = await adaptToDifficulty({ teacherId: o.teacherId, nodeId: node._id, classLevel: o.lesson.classLevel, subjectCode: o.lesson.subjectCode, title: node.title, content: base, difficulty: o.difficulty });
+      const adapted = await adaptToDifficulty({ teacherId: o.teacherId, nodeId: node._id, classLevel: o.lesson.classLevel, subjectCode: o.lesson.subjectCode, title: node.title, content: base, difficulty: o.difficulty, instruction: o.instruction });
       if (adapted) {
         base.steps = adapted.steps;
         if (adapted.writtenTrace) base.writtenTrace = adapted.writtenTrace;
@@ -672,7 +683,11 @@ export async function composeLessonDoc(o: ComposeOptions) {
     base.assessment = base.assessment.map((e) => ({ ...e, answer: "", explanation: undefined }));
   }
 
-  const layout = (prep?.layout as PrepLayout | null) ?? o.defaultLayout ?? null;
+  const baseLayout = (prep?.layout as PrepLayout | null) ?? o.defaultLayout ?? null;
+  // Illustration personnalisée de la séance : placée dans le déroulement (à la fin si la rubrique n'existe pas).
+  const layout: PrepLayout | null = o.illustration?.url
+    ? { ...(baseLayout ?? {}), images: [...(baseLayout?.images ?? []), { url: o.illustration.url, anchor: "déroulement", position: "center", widthPct: 70, aspect: o.illustration.aspect || 1.33 }] }
+    : baseLayout;
   const [y, m, dd] = o.lesson.date.split("-");
   const values: Record<string, string> = {
     teacher: o.teacherName,
@@ -700,6 +715,7 @@ export async function composeLessonDoc(o: ComposeOptions) {
         ["Niveau", `${values.level} · illustrations ${(ILLU_LABEL[o.illustrationLevel] ?? o.illustrationLevel).toLowerCase()}`],
       ];
   const doc: Doc = {
+    lowInk: o.lowInk ?? false,
     title: node.title,
     type: "lesson_plan",
     classLevel: o.lesson.classLevel,
@@ -723,7 +739,7 @@ export function previewOf(doc: Doc) {
   return { ...head, meta: doc.meta ?? [], blocks: blocksOf(doc), style: styleOf(doc), images: headerImages(doc) };
 }
 
-export async function buildLessonDocument(o: ComposeOptions & { format: "pdf" | "docx" }) {
+export async function buildLessonDocument(o: ComposeOptions & { format: "pdf" | "docx"; fingerprint?: string }) {
   const { doc, node, usedPrep, usedLibrary, usedLayout, adaptation } = await composeLessonDoc(o);
   const data = o.format === "pdf" ? await renderPdf(doc) : await renderDocx(doc);
   const slug = node.title.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^\w]+/g, "-").replace(/^-|-$/g, "").slice(0, 50);
@@ -733,6 +749,6 @@ export async function buildLessonDocument(o: ComposeOptions & { format: "pdf" | 
     data,
     o.format === "pdf" ? "application/pdf" : "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
   );
-  await GeneratedDocument.create({ teacherId: o.teacherId, lessonId: o.lesson._id, url: stored.url, key: stored.key, sizeBytes: stored.sizeBytes });
-  return { url: stored.url, sizeBytes: stored.sizeBytes, usedPrep, usedLibrary, usedLayout, adaptation };
+  const saved = await GeneratedDocument.create({ teacherId: o.teacherId, lessonId: o.lesson._id, url: stored.url, key: stored.key, sizeBytes: stored.sizeBytes, format: o.format, fingerprint: o.fingerprint, adaptation });
+  return { id: String(saved._id), url: stored.url, sizeBytes: stored.sizeBytes, usedPrep, usedLibrary, usedLayout, adaptation };
 }

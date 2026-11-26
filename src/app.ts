@@ -13,9 +13,11 @@ import { logger } from "./utils/logger.js";
 import { authRouter } from "./modules/auth.js";
 import { teacherRouter } from "./modules/teacher.js";
 import { libraryRouter } from "./modules/library.js";
+import { publicRouter } from "./modules/public.js";
 import { adminRouter } from "./modules/admin.js";
 import { uploadRouter } from "./uploadthing/router.js";
 import { localExportsDir } from "./services/storage.js";
+import { verifyAccessToken } from "./utils/jwt.js";
 
 function isAllowedOrigin(origin: string) {
   const allowed = env.corsOrigin.split(",").map((s) => s.trim()).filter(Boolean);
@@ -27,6 +29,19 @@ function isAllowedOrigin(origin: string) {
   } catch {
     return false;
   }
+}
+
+/** Clé de limitation par compte (jeton vérifié), sinon par adresse IP. */
+function accountKey(req: express.Request) {
+  const header = req.header("authorization");
+  if (header?.startsWith("Bearer ")) {
+    try {
+      return `u:${verifyAccessToken(header.slice(7)).sub}`;
+    } catch {
+      // jeton invalide : refusé plus loin par requireAuth
+    }
+  }
+  return `ip:${req.ip}`;
 }
 
 export function createApp() {
@@ -67,6 +82,28 @@ export function createApp() {
   app.use("/api/v1/auth/mfa/verify", limiter(15 * 60_000, 30));
   // Imports de fiches et de progressions (lecture par IA) : 30 par jour et par compte.
   app.use("/api/v1/teacher/imports", limiter(24 * 3_600_000, 30, (req) => `imp:${req.header("authorization")?.slice(-24) ?? req.ip}`));
+  // Import « Mon programme » (plusieurs documents lus par IA) : 15 envois ou nouveaux essais par jour et par compte.
+  // Le suivi de l'avancement (GET) et les corrections (PATCH) ne sont pas comptés.
+  app.use(
+    "/api/v1/teacher/program-imports",
+    rateLimit({
+      windowMs: 24 * 3_600_000,
+      max: 15,
+      standardHeaders: true,
+      legacyHeaders: false,
+      skip: (req) => req.method !== "POST" || /\/validate$/.test(req.path),
+      keyGenerator: (req) => `prog:${accountKey(req)}`,
+      message: { statusCode: 429, code: "TOO_MANY_IMPORTS", message: "Trop d'imports aujourd'hui : réessaie demain, ou corrige l'import en cours." },
+    })
+  );
+  // Modification d'une fiche avec l'IA (recomposition immédiate) : 40 par jour et par compte ; fiches et reports : 300.
+  app.use(/^\/api\/v1\/teacher\/lessons\/[^/]+\/file\/options$/, limiter(24 * 3_600_000, 40, (req) => `fopt:${accountKey(req)}`));
+  // Illustrations générées (image IA, plus coûteuses) : 15 par jour et par compte.
+  app.use(
+    /^\/api\/v1\/teacher\/lessons\/[^/]+\/illustration$/,
+    rateLimit({ windowMs: 24 * 3_600_000, max: 15, standardHeaders: true, legacyHeaders: false, skip: (req) => req.method !== "POST", keyGenerator: (req) => `illus:${accountKey(req)}` })
+  );
+  app.use(/^\/api\/v1\/teacher\/lessons\/[^/]+\/(file|postpone)$/, limiter(24 * 3_600_000, 300, (req) => `file:${accountKey(req)}`));
   // Aperçus de fiche (niveau adapté par IA si besoin, mis en cache) : 200 par jour et par compte.
   app.use(/^\/api\/v1\/teacher\/lessons\/[^/]+\/preview$/, limiter(24 * 3_600_000, 200, (req) => `prev:${req.header("authorization")?.slice(-24) ?? req.ip}`));
   // Génération de PDF/Word : opération coûteuse, limitée par utilisateur authentifié.
@@ -81,6 +118,7 @@ export function createApp() {
   app.use("/api/v1/auth", authRouter);
   app.use("/api/v1/teacher", teacherRouter);
   app.use("/api/v1/library", libraryRouter);
+  app.use("/api/v1/public", publicRouter);
   app.use("/api/v1/admin", adminRouter);
   app.use("/exports", express.static(localExportsDir, { maxAge: "30d", immutable: true }));
 

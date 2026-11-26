@@ -17,6 +17,7 @@ import { EXTRACT_V1, REVIEW_V1, WRITE_V1 } from "./prompts.js";
 import { htmlToText, isAllowedHost, safeFetch } from "./safe-fetch.js";
 import { deterministicChecks, lessonContentSchema } from "../services/content-schema.js";
 import { isStoredUrl, readStoredFile, storeFile } from "../services/storage.js";
+import { PROGRAM_IMPORT_STEPS, programImportHandlers } from "../services/program-import.js";
 
 /* ───────────── Paramètres des tâches ───────────── */
 
@@ -42,7 +43,8 @@ export const generateParams = z.object({
 
 export const buildLibraryParams = z.object({
   classLevel: z.string(),
-  subjectCode: z.string(),
+  /** Absent : toutes les matières de la classe (l'administrateur ne choisit pas les matières une par une). */
+  subjectCode: z.string().optional(),
   types: z.array(z.enum(RESOURCE_TYPES)).min(1).max(6).default(["lesson_plan", "exercises", "assessment"]),
   difficulties: z.array(z.enum(DIFFICULTIES)).min(1).max(3).default(["standard"]),
   term: z.number().int().min(1).max(3).optional(),
@@ -66,6 +68,10 @@ export const STEPS: Record<AiJobKind, string[]> = {
   teacher_import: ["extract"],
   // Recherche de documents officiels sur le web : des candidats à vérifier, jamais une source validée d'office.
   research_sources: ["search", "save_candidates"],
+  // Import « Mon programme » (plusieurs documents de l'enseignant) : en arrière-plan, reprenable étape par étape.
+  program_import: [...PROGRAM_IMPORT_STEPS],
+  // Illustration d'une fiche demandée par l'enseignant : traitée immédiatement par l'API.
+  teacher_illustration: ["generate"],
 };
 
 export function generationKey(p: {
@@ -381,9 +387,10 @@ const handlers: Record<string, (ctx: StepCtx) => Promise<StepResult>> = {
   /* build_library */
   async list_nodes({ job }) {
     const p = buildLibraryParams.parse(job.params);
-    const filter: Record<string, unknown> = { classLevel: p.classLevel, subjectCode: p.subjectCode, kind: "lesson", status: "validated", ownerId: null };
+    const filter: Record<string, unknown> = { classLevel: p.classLevel, kind: "lesson", status: "validated", ownerId: null };
+    if (p.subjectCode) filter.subjectCode = p.subjectCode;
     if (p.term) filter.term = p.term;
-    const ids = await CurriculumNode.find(filter).sort({ order: 1 }).distinct("_id");
+    const ids = (await CurriculumNode.find(filter).sort({ subjectCode: 1, order: 1 }).select("_id").lean()).map((n) => n._id);
     return { output: { nodeIds: ids.map(String) } };
   },
 
@@ -466,6 +473,8 @@ Cherche d'abord sur : ${domains}.`,
     return { output: await saveResearchCandidates(String(job._id), outputs.search?.candidates ?? []), finalStatus: "done" as const };
   },
 });
+
+Object.assign(handlers, programImportHandlers);
 
 /** Candidats de la recherche → sources « à vérifier » (sites officiels de la liste blanche seulement, sans doublon). */
 export async function saveResearchCandidates(jobId: string, candidates: unknown[]) {
