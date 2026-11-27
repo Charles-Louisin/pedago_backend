@@ -57,6 +57,7 @@ export function toMe(user: any, profile: any) {
     phone: user.phone ?? null,
     role: user.role,
     emailVerified: Boolean(user.emailVerified),
+    uiLanguage: user.uiLanguage ?? null,
     profile: profile
       ? {
           subsystem: profile.subsystem,

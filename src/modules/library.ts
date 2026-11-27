@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { lessonUnits } from "../services/units.js";
 import { z } from "zod";
 import { ALL_CLASS_LEVELS, CurriculumNode, DIFFICULTIES, LessonInstance, RESOURCE_TYPES, Resource, SourceDocument, TeacherProfile } from "../models/index.js";
 import { requireAuth, requireVerifiedEmail, type AuthedRequest } from "../middleware/auth.js";
@@ -41,9 +42,10 @@ libraryRouter.get(
         .lean(),
       Resource.countDocuments(filter),
     ]);
-    // Taille du PDF à jour (si déjà produit) : affichée sur la carte avant le téléchargement.
+    // Taille du PDF à jour (si déjà produit) : affichée sur la carte avant le téléchargement. Unité de la leçon, si le programme en a.
+    const units = await lessonUnits(items.map((r) => String(r.nodeId ?? "")).filter(Boolean));
     res.json({
-      items: items.map(({ _id, assets, ...r }) => ({ id: String(_id), ...r, pdfBytes: assets?.pdf?.contentVersion === r.contentVersion ? assets.pdf.sizeBytes ?? null : null })),
+      items: items.map(({ _id, assets, ...r }) => ({ id: String(_id), ...r, unit: units.get(String(r.nodeId ?? "")) ?? null, pdfBytes: assets?.pdf?.contentVersion === r.contentVersion ? assets.pdf.sizeBytes ?? null : null })),
       total,
       page: q.page,
       limit: q.limit,

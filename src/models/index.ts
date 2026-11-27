@@ -8,3 +8,4 @@ export * from "./prep.js";
 export * from "./teacher-import.js";
 export * from "./notification.js";
 export * from "./site-media.js";
+export * from "./method.js";

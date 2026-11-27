@@ -9,6 +9,8 @@ const userSchema = new Schema(
     /** Deux rôles : l'enseignant, et l'administrateur (qui est aussi le relecteur humain des contenus). */
     role: { type: String, enum: ["teacher", "admin"], default: "teacher", index: true },
     disabled: { type: Boolean, default: false },
+    /** Langue de l'interface de l'app (distincte du sous-système : les contenus restent dans la langue du sous-système). */
+    uiLanguage: { type: String, enum: ["fr", "en"] },
     failedLogins: { type: Number, default: 0, select: false },
     lockedUntil: { type: Date, select: false },
     lastLoginAt: Date,

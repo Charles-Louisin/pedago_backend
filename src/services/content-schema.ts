@@ -46,6 +46,11 @@ export const lessonContentSchema = z.object({
   assessment: z.array(exercise).max(30).default([]),
   localContext: z.array(z.string().max(400)).max(10).default([]),
   body: z.string().max(20000).optional(),
+  /** Rubriques propres à la méthode de préparation suivie (« Méthodes et techniques »…), avec leur intitulé exact. */
+  extraSections: z
+    .array(z.object({ label: z.string().trim().min(1).max(120), lines: z.array(z.string().max(1500)).max(20).default([]) }))
+    .max(10)
+    .default([]),
 });
 export type LessonContent = z.infer<typeof lessonContentSchema>;
 

@@ -7,7 +7,7 @@ import { AiJob, IMPORT_CATEGORIES, Subject, TeacherImport, TeacherProfile, Teach
 import { AiNotConfiguredError, BudgetExceededError, chat, parseJson, type ChatMessage } from "../ai/openrouter.js";
 import { IMPORT_CLASSIFY_V1, IMPORT_CURRICULUM_V1, IMPORT_TIMETABLE_V1 } from "../ai/prompts.js";
 import { HttpError, badRequest, conflict, notFound } from "../utils/http-error.js";
-import { parseProgression, saveImportedCurriculum } from "./curriculum.js";
+import { parseProgressionTree, saveImportedCurriculum } from "./curriculum.js";
 import { sniffMime } from "./imports.js";
 import { docxText, OfficeReadError, xlsxText, zipEntryNames } from "./office-text.js";
 import { saveTimetableVersion } from "./planning.js";
@@ -311,13 +311,27 @@ const handlers: Record<string, (ctx: Ctx) => Promise<StepResult>> = {
           notes.push(`« ${f.name} » : la lecture des photos et des scans demande l'IA, non activée.`);
           continue;
         }
-        const lessons = parseProgression(f.text);
+        // Sans IA : lecture déterministe qui garde les niveaux écrits (domaine, compétence, séquence/unité, leçon).
+        const tree = parseProgressionTree(f.text);
         const guess = matchSubject(f.name.replace(/\.\w+$/, ""), subsystem, subjects);
+        const refOf = (i: number) => `f${n}-n${i + 1}`;
         addSubject({
           subjectCode: guess.code,
           writtenName: f.name.replace(/\.\w+$/, "").slice(0, 160),
           classLevelWritten: null,
-          nodes: lessons.map((l, i) => ({ ...emptyNode(`f${n}-l${i + 1}`, "lesson", l.title, n), objectives: l.objectives, term: l.term, week: l.week, confidence: 0.85 })),
+          nodes: tree.map((t, i) => ({
+            ...emptyNode(refOf(i), t.kind, t.title, n),
+            parentRef: t.parent == null ? null : refOf(t.parent),
+            label: t.label,
+            objectives: t.objectives,
+            activities: t.activities,
+            prerequisites: t.prerequisites,
+            term: t.term,
+            week: t.week,
+            durationMin: t.durationMin,
+            isAssessment: t.isAssessment,
+            confidence: 0.85,
+          })),
         });
       }
     }

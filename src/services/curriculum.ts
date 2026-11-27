@@ -1,5 +1,5 @@
 import { Types } from "mongoose";
-import { CurriculumNode, LessonInstance, Timetable, subsystemOf, type ClassLevel } from "../models/index.js";
+import { CurriculumNode, CurriculumPosition, LessonInstance, POSITION_HISTORY_MAX, Timetable, subsystemOf, type ClassLevel } from "../models/index.js";
 
 export type ParsedLesson = { title: string; objectives: string[]; term: number | null; week: number | null };
 
@@ -68,9 +68,13 @@ export function parseProgression(text: string): ParsedLesson[] {
   return out;
 }
 
-/** Leçons utilisées pour un enseignant : sa progression si elle existe pour la matière, sinon le programme officiel. */
+/**
+ * Leçons utilisées pour un enseignant : sa progression si elle existe pour la matière, sinon le programme officiel.
+ * Si l'enseignant a indiqué où il en est (« Où j'en suis »), les leçons qui précèdent cette position sont marquées
+ * `alreadyTaught` (calculé, rien n'est écrit) et `positionSetAt` indique depuis quand la file reprend.
+ */
 export async function lessonsFor(teacherId: string, classLevel: string, subjects: string[]) {
-  const [own, official] = await Promise.all([
+  const [own, official, positions] = await Promise.all([
     CurriculumNode.find({ ownerId: teacherId, classLevel, subjectCode: { $in: subjects }, kind: "lesson", status: { $ne: "retired" } })
       .sort({ order: 1 })
       .select("_id subjectCode title objectives durationMin term order priority prerequisites matchedNodeId alreadyTaught")
@@ -79,11 +83,21 @@ export async function lessonsFor(teacherId: string, classLevel: string, subjects
       .sort({ order: 1 })
       .select("_id subjectCode title objectives durationMin term order priority prerequisites")
       .lean(),
+    CurriculumPosition.find({ teacherId, classLevel, subjectCode: { $in: subjects } }).select("subjectCode nodeId setAt").lean(),
   ]);
-  const map = new Map<string, { source: "mine" | "official"; nodes: typeof official }>();
+  type Node = (typeof official)[number] & { alreadyTaught?: boolean; matchedNodeId?: unknown };
+  const map = new Map<string, { source: "mine" | "official"; nodes: Node[]; position: { nodeId: string; setAt: Date } | null }>();
   for (const s of subjects) {
     const mine = own.filter((n) => n.subjectCode === s);
-    map.set(s, mine.length ? { source: "mine", nodes: mine } : { source: "official", nodes: official.filter((n) => n.subjectCode === s) });
+    const nodes: Node[] = mine.length ? mine : official.filter((n) => n.subjectCode === s);
+    const pos = positions.find((p) => p.subjectCode === s);
+    // Position valable seulement si sa leçon fait partie de la liste en vigueur (une nouvelle progression l'annule).
+    const at = pos ? nodes.findIndex((n) => String(n._id) === String(pos.nodeId)) : -1;
+    map.set(s, {
+      source: mine.length ? "mine" : "official",
+      nodes: at === -1 ? nodes : nodes.map((n, i) => ({ ...n, alreadyTaught: i < at })),
+      position: at === -1 || !pos ? null : { nodeId: String(pos.nodeId), setAt: pos.setAt },
+    });
   }
   return map;
 }
@@ -241,4 +255,144 @@ export async function resetTeacherCurriculum(teacherId: string, classLevel: stri
   await CurriculumNode.updateMany({ ownerId: teacherId, classLevel, subjectCode, status: { $ne: "retired" } }, { status: "retired" });
   await LessonInstance.deleteMany({ teacherId, classLevel, subjectCode, date: { $gt: today }, status: "planned", origin: "plan" });
   await Timetable.updateMany({ teacherId, classLevel }, { $unset: { plannedFrom: 1, plannedThrough: 1 } });
+}
+
+/**
+ * Règle « Où j'en suis » pour une matière : la leçon choisie devient la prochaine à faire, tout ce qui précède compte
+ * comme déjà enseigné (aucun bilan n'est créé). Les séances prévues à partir de maintenant sont recalculées par le
+ * moteur de planification (sans IA) ; le passé n'est pas touché. La position précédente est gardée (retour possible).
+ * `nodeId` à null : revient à la position précédente (ou à aucune).
+ */
+export async function setCurriculumPosition(o: { teacherId: string; classLevel: string; subjectCode: string; nodeId: string | null; today: string; now?: string }) {
+  const { teacherId, classLevel, subjectCode } = o;
+  const current = await CurriculumPosition.findOne({ teacherId, classLevel, subjectCode });
+  let target: string | null = o.nodeId;
+  if (target) {
+    const entry = (await lessonsFor(teacherId, classLevel, [subjectCode])).get(subjectCode);
+    if (!entry?.nodes.some((n) => String(n._id) === target)) return null;
+  }
+  const setAt = new Date();
+  if (o.nodeId === null) {
+    // Retour en arrière : la dernière position de l'historique, ou plus de position du tout.
+    const prev = current?.history.at(-1);
+    target = prev?.nodeId ? String(prev.nodeId) : null;
+    if (current) {
+      if (target) {
+        current.nodeId = new Types.ObjectId(target);
+        current.setAt = setAt;
+        current.history.pop();
+        await current.save();
+      } else await current.deleteOne();
+    }
+  } else if (current) {
+    if (String(current.nodeId) !== target) {
+      current.history.push({ nodeId: current.nodeId, setAt: current.setAt });
+      if (current.history.length > POSITION_HISTORY_MAX) current.history.splice(0, current.history.length - POSITION_HISTORY_MAX);
+    }
+    current.nodeId = new Types.ObjectId(target!);
+    current.setAt = setAt;
+    await current.save();
+  } else {
+    await CurriculumPosition.create({ teacherId, classLevel, subjectCode, nodeId: target, setAt, history: [] });
+  }
+  // Séances encore « prévues » de la matière, à partir de maintenant : recalculées. Celles d'aujourd'hui déjà
+  // commencées restent (elles appartiennent au bilan du jour).
+  const fromNow = o.now ? [{ date: { $gt: o.today } }, { date: o.today, start: { $gte: o.now } }] : [{ date: { $gte: o.today } }];
+  await LessonInstance.deleteMany({ teacherId, classLevel, subjectCode, status: "planned", origin: "plan", $or: fromNow });
+  await Timetable.updateMany({ teacherId, classLevel }, { $unset: { plannedFrom: 1, plannedThrough: 1 } });
+  const after = await CurriculumPosition.findOne({ teacherId, classLevel, subjectCode }).lean();
+  // Retour possible tant qu’une position existe (au pire, retour à « aucune position »).
+  return { nodeId: after ? String(after.nodeId) : null, canUndo: Boolean(after) };
+}
+
+/** Nœud d'une progression lue AVEC sa hiérarchie (domaine → compétence → séquence/unité → leçon), sans IA. */
+export type ParsedTreeNode = {
+  kind: "domain" | "competency" | "unit" | "lesson";
+  /** Intitulé tel qu'écrit (« Séquence 1 », « Unité 2 ») pour une unité. */
+  label: string | null;
+  title: string;
+  /** Index du parent dans la liste (null : racine). */
+  parent: number | null;
+  objectives: string[];
+  activities: string[];
+  prerequisites: string[];
+  term: number | null;
+  week: number | null;
+  durationMin: number | null;
+  isAssessment: boolean;
+};
+
+// Séparateurs acceptés après un intitulé : tiret court ou long, deux-points, point.
+const RE_DOMAIN = /^(?:domaine|domain)\s*[:：]\s*(.+)$/i;
+const RE_COMPETENCY = /^(?:comp[ée]tences?|competency|competencies)\s*[:：]\s*(.+)$/i;
+const RE_UNIT = /^((?:s[ée]quence|unit[ée]?|chapitre|chapter|module|th[èe]me|theme)\s*(?:\d+|[IVX]+)?)\s*[-–—:.]\s*(.+)$/i;
+const RE_TERM = /^(?:trimestre|term|terme)\s*(\d)\b\s*$/i;
+const RE_WEEK = /^(?:semaine|sem\.?|week)\s*(\d{1,2})\s*[-–—:.]?\s*(.*)$/i;
+const RE_LESSON_PREFIX = /^(?:[-*•–—·]\s*)?(?:le[çc]on|lesson)\s*\d+\s*[-–—:.]?\s*/i;
+const SECTIONS = /\.\s+(?=(?:objectifs?|objectives?|activit[ée]s?|activities|activity|pr[ée]requis|prerequisites?|dur[ée]e|duration)\s*:)/i;
+
+/**
+ * Lit une progression collée ou extraite d'un document en gardant ses niveaux : « Domaine : … », « Compétence : … »,
+ * « Séquence 1 : … » (ou Unité, Chapitre, Module, Thème), « Trimestre 2 », « Semaine 5 — Leçon 4 : … ».
+ * Sur une ligne de leçon, « Objectifs : a ; b », « Activité : … », « Prérequis : … », « Durée : 45 min » sont rangés à part.
+ * Rien n'est inventé : sans niveau écrit, les leçons sont à la racine.
+ */
+export function parseProgressionTree(text: string): ParsedTreeNode[] {
+  const out: ParsedTreeNode[] = [];
+  let term: number | null = null;
+  let domain: number | null = null;
+  let competency: number | null = null;
+  let unit: number | null = null;
+  const lines = text.split(/\r?\n/).map((l) => l.replace(/\t/g, " ").replace(/\s+/g, " ").trim()).filter(Boolean);
+  lines.forEach((line, i) => {
+    // Titre du document (« PROGRESSION ANNUELLE DE … ») : ignoré.
+    if (i === 0 && /^(progression|scheme of work|programme)\b/i.test(line)) return;
+    const t = line.match(RE_TERM);
+    if (t) return void (term = Number(t[1]));
+    const base = { objectives: [], activities: [], prerequisites: [], term, week: null, durationMin: null, isAssessment: false };
+    const d = line.match(RE_DOMAIN);
+    if (d) {
+      out.push({ ...base, kind: "domain", label: null, title: d[1].slice(0, 200), parent: null });
+      domain = out.length - 1;
+      competency = unit = null;
+      return;
+    }
+    const c = line.match(RE_COMPETENCY);
+    if (c) {
+      out.push({ ...base, kind: "competency", label: null, title: c[1].slice(0, 200), parent: domain });
+      competency = out.length - 1;
+      unit = null;
+      return;
+    }
+    const u = line.match(RE_UNIT);
+    if (u && !RE_LESSON_PREFIX.test(line)) {
+      out.push({ ...base, kind: "unit", label: u[1].replace(/\s+/g, " ").trim().slice(0, 80), title: u[2].slice(0, 200), parent: competency ?? domain });
+      unit = out.length - 1;
+      return;
+    }
+    let rest = line;
+    let week: number | null = null;
+    const w = rest.match(RE_WEEK);
+    if (w) {
+      week = Number(w[1]);
+      rest = w[2];
+      if (!rest) return;
+    }
+    rest = rest.replace(RE_LESSON_PREFIX, "").replace(/^[-*•–—·]\s*/, "").trim();
+    if (rest.length < 3) return;
+    const [head, ...parts] = rest.split(SECTIONS);
+    const node: ParsedTreeNode = { ...base, kind: "lesson", label: null, title: head.replace(/\.$/, "").trim().slice(0, 200), parent: unit ?? competency ?? domain, week };
+    for (const p of parts) {
+      const [key, ...val] = p.split(":");
+      const v = val.join(":").trim().replace(/\.$/, "");
+      if (/^objecti/i.test(key)) node.objectives = v.split(/\s*;\s*/).filter((x) => x.length > 2).slice(0, 10);
+      else if (/^activ/i.test(key)) node.activities = [v.slice(0, 300)];
+      else if (/^pr[ée]req/i.test(key)) node.prerequisites = v.split(/\s*;\s*/).filter(Boolean).slice(0, 5);
+      else if (/^dur/i.test(key)) node.durationMin = Number(v.match(/\d+/)?.[0]) || null;
+    }
+    node.isAssessment = /^(?:[ée]valuation|assessment|composition|r[ée]vision|revision)\b/i.test(node.title);
+    out.push(node);
+    if (out.length >= 800) return;
+  });
+  return out;
 }

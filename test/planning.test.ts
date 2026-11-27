@@ -33,6 +33,9 @@ before(async () => {
     teacherId, classLevel: "CP", schoolYear: "2026-2027",
     slots: [{ weekday: 1, start: "08:00", end: "09:00", subjectCode: "MATH" }, { weekday: 3, start: "08:00", end: "09:00", subjectCode: "MATH" }],
   });
+  // L'app ne planifie jamais avant la création de l'emploi du temps (pas de retard fictif) : on le date du début
+  // de l'année, pour que le test garde le même résultat quel que soit le jour où il est lancé.
+  await Timetable.collection.updateOne({ teacherId: new mongoose.Types.ObjectId(teacherId) }, { $set: { createdAt: new Date("2026-09-01T00:00:00Z") } });
 });
 
 after(async () => {

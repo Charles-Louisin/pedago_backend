@@ -8,6 +8,7 @@ import {
   CatchUpItem,
   CLASS_LEVELS,
   CurriculumNode,
+  CurriculumPosition,
   LessonInstance,
   ProgressEvent,
   Resource,
@@ -41,7 +42,8 @@ import {
 import { runJobNow } from "../ai/worker.js";
 import { acceptLessonIllustration, createLessonIllustration, customizeLessonFile, discardIllustrationDraft, lessonFile, lessonFiles, lessonIllustration, postponeLesson, removeLessonIllustration } from "../services/lesson-files.js";
 import { AiNotConfiguredError, BudgetExceededError } from "../ai/openrouter.js";
-import { lessonsFor, parseProgression, resetTeacherCurriculum, saveTeacherCurriculum } from "../services/curriculum.js";
+import { lessonsFor, parseProgression, resetTeacherCurriculum, saveTeacherCurriculum, setCurriculumPosition } from "../services/curriculum.js";
+import { lessonUnits } from "../services/units.js";
 import { buildLessonDocument, composeLessonDoc, previewOf, type ComposeOptions } from "../services/exports.js";
 import { prepLayoutSchema, type PrepLayout } from "../services/layout.js";
 import { isStoredUrl } from "../services/storage.js";
@@ -113,6 +115,16 @@ const profileSchema = z
   .refine((p) => p.assignments.every((a) => (CLASS_LEVELS[p.subsystem] as readonly string[]).includes(a.classLevel)), {
     message: "Les classes doivent appartenir au sous-système choisi",
   });
+
+/** Langue de l'interface (choisie juste après la connexion, modifiable dans Moi). */
+teacherRouter.put(
+  "/me/language",
+  validate(z.object({ uiLanguage: z.enum(["fr", "en"]) })),
+  ah(async (req, res) => {
+    await User.updateOne({ _id: uid(req) }, { uiLanguage: req.body.uiLanguage });
+    res.json({ uiLanguage: req.body.uiLanguage });
+  })
+);
 
 teacherRouter.put(
   "/me/profile",
@@ -395,9 +407,10 @@ teacherRouter.get(
       .sort({ date: 1, start: 1 })
       .lean();
     const nodeIds = [...new Set(lessons.map((l) => String(l.nodeId)))];
-    const [nodes, resources] = await Promise.all([
+    const [nodes, resources, units] = await Promise.all([
       CurriculumNode.find({ _id: { $in: nodeIds } }).select("title objectives durationMin subjectCode term").lean(),
       resourcesFor(nodeIds, profile.preferences ?? {}),
+      lessonUnits(nodeIds),
     ]);
     const nodeMap = new Map(nodes.map((n) => [String(n._id), n]));
     res.json({
@@ -417,7 +430,7 @@ teacherRouter.get(
           rev: l.rev,
           remainingObjectives: l.remainingObjectives ?? [],
           node: node
-            ? { id: String(node._id), title: node.title, objectives: node.objectives, durationMin: node.durationMin, term: node.term }
+            ? { id: String(node._id), title: node.title, objectives: node.objectives, durationMin: node.durationMin, term: node.term, unit: units.get(String(node._id)) ?? null }
             : null,
           resources: resources.get(String(l.nodeId)) ?? [],
         };
@@ -535,8 +548,10 @@ teacherRouter.get(
       .populate<{ nodeId: { title: string; objectives: string[] } }>("nodeId", "title objectives")
       .populate<{ lessonId: { date: string; start: string } }>("lessonId", "date start")
       .lean();
+    const units = await lessonUnits(items.map((i) => String((i.nodeId as { _id?: unknown })?._id ?? "")).filter(Boolean));
     res.json(
       items.map((i) => ({
+        unit: units.get(String((i.nodeId as { _id?: unknown })?._id ?? "")) ?? null,
         id: String(i._id),
         reason: i.reason,
         classLevel: i.classLevel,
@@ -703,9 +718,15 @@ teacherRouter.get(
     const profile = await profileOf(uid(req));
     assertTeaches(profile, classLevel);
     const entry = (await lessonsFor(uid(req), classLevel, [subjectCode])).get(subjectCode)!;
+    const [units, position] = await Promise.all([
+      lessonUnits(entry.nodes.map((n) => String(n._id))),
+      CurriculumPosition.findOne({ teacherId: uid(req), classLevel, subjectCode }).select("nodeId history").lean(),
+    ]);
     res.json({
       source: entry.source,
+      position: entry.position ? { nodeId: entry.position.nodeId, canUndo: true, previous: position?.history.length ?? 0 } : null,
       lessons: entry.nodes.map((n) => ({
+        unit: units.get(String(n._id)) ?? null,
         id: String(n._id),
         title: n.title,
         objectives: n.objectives ?? [],
@@ -744,6 +765,61 @@ teacherRouter.put(
     const profile = await profileOf(uid(req));
     assertTeaches(profile, classLevel);
     res.json(await saveTeacherCurriculum(uid(req), classLevel, subjectCode, lessons, today, startAt));
+  })
+);
+
+/**
+ * « Où j'en suis » : la leçon où l'enseignant se trouve dans une matière (tout ce qui précède compte comme fait,
+ * sans bilan). `nodeId: null` revient à la position précédente. Recalcul déterministe, sans IA.
+ */
+teacherRouter.put(
+  "/curriculum/position",
+  validate(
+    classSubject.extend({
+      nodeId: z.string().regex(/^[a-f\d]{24}$/i).nullable(),
+      today: localDate,
+      now: z.string().regex(/^\d{2}:\d{2}$/).optional(),
+    })
+  ),
+  ah(async (req, res) => {
+    const { classLevel, subjectCode, nodeId, today, now } = req.body;
+    const profile = await profileOf(uid(req));
+    assertTeaches(profile, classLevel);
+    const out = await setCurriculumPosition({ teacherId: uid(req), classLevel, subjectCode, nodeId, today, now });
+    if (!out) throw badRequest("BAD_POSITION", "Cette leçon ne fait pas partie de ton programme");
+    res.json(out);
+  })
+);
+
+/** Résumé de l'espace de l'enseignant (page de préparation après la configuration) : classes, matières, leçons, unités. */
+teacherRouter.get(
+  "/workspace",
+  ah(async (req, res) => {
+    const profile = await profileOf(uid(req));
+    const classes = await Promise.all(
+      profile.assignments.map(async (a) => {
+        const [bySubject, timetable] = await Promise.all([
+          lessonsFor(uid(req), a.classLevel, a.subjects),
+          Timetable.findOne({ teacherId: uid(req), classLevel: a.classLevel, schoolYear: profile.schoolYear }).select("slots").lean(),
+        ]);
+        const subjects = await Promise.all(
+          a.subjects.map(async (code) => {
+            const e = bySubject.get(code)!;
+            const units = await lessonUnits(e.nodes.map((n) => String(n._id)));
+            return {
+              subjectCode: code,
+              source: e.source,
+              lessons: e.nodes.length,
+              taught: e.nodes.filter((n) => n.alreadyTaught).length,
+              units: new Set([...units.values()].map((u) => u.id)).size,
+              weeklySlots: timetable?.slots.filter((s) => s.subjectCode === code).length ?? 0,
+            };
+          })
+        );
+        return { classLevel: a.classLevel, subjects };
+      })
+    );
+    res.json({ schoolYear: profile.schoolYear, subsystem: profile.subsystem, classes });
   })
 );
 

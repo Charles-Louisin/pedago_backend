@@ -95,7 +95,8 @@ const sourceDocumentSchema = new Schema(
     publishedOn: String,
     consultedAt: { type: Date, default: Date.now },
     reference: String,
-    docType: { type: String, enum: ["curriculum", "law", "calendar", "textbook_list", "exam", "guide", "other"], default: "other" },
+    // lesson_template : fiche modèle (méthode de préparation à suivre), comme un guide pédagogique.
+    docType: { type: String, enum: ["curriculum", "law", "calendar", "textbook_list", "exam", "guide", "lesson_template", "other"], default: "other" },
     sha256: String,
     usageRights: { type: String, enum: ["public_official", "licensed", "reference_only", "unknown"], default: "unknown" },
     nextReviewOn: String,
@@ -108,3 +109,27 @@ const sourceDocumentSchema = new Schema(
 );
 sourceDocumentSchema.index({ sha256: 1 }, { sparse: true });
 export const SourceDocument = mongoose.model("SourceDocument", sourceDocumentSchema);
+
+/** Nombre de positions précédentes gardées (pour revenir en arrière). */
+export const POSITION_HISTORY_MAX = 20;
+
+/**
+ * « Où j'en suis » : la leçon où l'enseignant se trouve, par classe et matière. Tout ce qui la précède compte comme
+ * déjà enseigné (sans faux bilan) ; le moteur de planification reprend à partir d'elle. Chaque changement garde
+ * la position précédente dans `history` (retour en arrière possible).
+ */
+const curriculumPositionSchema = new Schema(
+  {
+    teacherId: { type: Schema.Types.ObjectId, ref: "User", required: true },
+    classLevel: { type: String, required: true },
+    subjectCode: { type: String, required: true },
+    /** Leçon où en est l'enseignant (la prochaine à faire). */
+    nodeId: { type: Schema.Types.ObjectId, ref: "CurriculumNode", required: true },
+    /** Moment du réglage : seules les séances créées après comptent pour reprendre la file. */
+    setAt: { type: Date, required: true },
+    history: [{ _id: false, nodeId: { type: Schema.Types.ObjectId, ref: "CurriculumNode" }, setAt: Date }],
+  },
+  { timestamps: true }
+);
+curriculumPositionSchema.index({ teacherId: 1, classLevel: 1, subjectCode: 1 }, { unique: true });
+export const CurriculumPosition = mongoose.model("CurriculumPosition", curriculumPositionSchema);

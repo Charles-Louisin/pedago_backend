@@ -3,7 +3,7 @@ import { AlignmentType, Document, HeadingLevel, Packer, Paragraph, Table, TableC
 import crypto from "node:crypto";
 import { createRequire } from "node:module";
 import { AdaptedContent, AiJob, CurriculumNode, GeneratedDocument, Resource, SourceDocument, TeacherPrep, CLASS_LABELS, type ClassLevel } from "../models/index.js";
-import { prepStyleSchema, type PrepImage, type PrepLayout, type PrepStyle } from "./layout.js";
+import { prepLayoutSchema, prepStyleSchema, type PrepImage, type PrepLayout, type PrepStyle } from "./layout.js";
 import { chat } from "../ai/openrouter.js";
 import { env } from "../config/env.js";
 import { z } from "zod";
@@ -166,6 +166,8 @@ function sections(d: Doc): Block[] {
   if (c.lowResourceAlternatives.length)
     out.push({ heading: "Sans électricité ni matériel spécialisé", lines: c.lowResourceAlternatives.map((o) => `• ${o}`) });
   if (c.largeClassTips.length) out.push({ heading: "Pour une classe nombreuse", lines: c.largeClassTips.map((o) => `• ${o}`) });
+  // Rubriques propres à la méthode suivie ou à l'enseignant, avec leur intitulé exact.
+  for (const x of d.extra ?? []) if (x.lines.length) out.push({ heading: x.label, lines: x.lines });
   if (d.sources.length) out.push({ heading: "Sources", lines: d.sources });
   return out;
 }
@@ -463,10 +465,13 @@ export function ensureExport(resourceId: string, format: "pdf" | "docx") {
   return p;
 }
 
-type ResourceLike = { title: string; type: string; classLevel: string; subjectCode: string; difficulty: string; contentVersion: number; content: unknown; sources: { sourceId?: unknown }[]; status?: string };
+type ResourceLike = { title: string; type: string; classLevel: string; subjectCode: string; difficulty: string; contentVersion: number; content: unknown; sources: { sourceId?: unknown }[]; status?: string; methodLayout?: unknown };
 
 async function resourceDoc(r: ResourceLike): Promise<Doc> {
   const sources = await SourceDocument.find({ _id: { $in: r.sources.map((s) => s.sourceId) } }).select("title issuer url").lean();
+  const content = lessonContentSchema.parse(r.content);
+  // Ressource rédigée selon une méthode officielle : son cartouche, ses rubriques et ses intitulés commandent le PDF.
+  const layout = r.methodLayout ? prepLayoutSchema.safeParse(r.methodLayout) : null;
   return {
     title: r.title,
     type: r.type,
@@ -474,8 +479,10 @@ async function resourceDoc(r: ResourceLike): Promise<Doc> {
     subjectCode: r.subjectCode,
     difficulty: r.difficulty,
     contentVersion: r.contentVersion,
-    content: lessonContentSchema.parse(r.content),
+    content,
     sources: sources.map((s) => `${s.issuer} — ${s.title}${s.url ? ` (${s.url})` : ""}`),
+    ...(layout?.success ? { layout: layout.data } : {}),
+    ...(content.extraSections.length ? { extra: content.extraSections } : {}),
   };
 }
 
@@ -683,7 +690,9 @@ export async function composeLessonDoc(o: ComposeOptions) {
     base.assessment = base.assessment.map((e) => ({ ...e, answer: "", explanation: undefined }));
   }
 
-  const baseLayout = (prep?.layout as PrepLayout | null) ?? o.defaultLayout ?? null;
+  // Mise en page : celle de l'enseignant (sa fiche, puis son modèle), sinon celle de la méthode officielle suivie par la bibliothèque.
+  const methodLayout = plan?.methodLayout ? prepLayoutSchema.safeParse(plan.methodLayout) : null;
+  const baseLayout = (prep?.layout as PrepLayout | null) ?? o.defaultLayout ?? (methodLayout?.success ? methodLayout.data : null);
   // Illustration personnalisée de la séance : placée dans le déroulement (à la fin si la rubrique n'existe pas).
   const layout: PrepLayout | null = o.illustration?.url
     ? { ...(baseLayout ?? {}), images: [...(baseLayout?.images ?? []), { url: o.illustration.url, anchor: "déroulement", position: "center", widthPct: 70, aspect: o.illustration.aspect || 1.33 }] }
@@ -725,7 +734,8 @@ export async function composeLessonDoc(o: ComposeOptions) {
     content: base,
     includeAnswers: o.includeAnswers,
     remarks: p.notes,
-    extra: p.extra,
+    // Rubriques propres : celles de l'enseignant, sinon celles de la méthode officielle (« Méthodes et techniques »…).
+    extra: p.extra?.length ? p.extra : base.extraSections.length ? base.extraSections : undefined,
     layout,
     sources: plan && !layout ? [`Bibliothèque PEDAGO${plan.approvedAt ? " (validée)" : ""}`] : [],
     meta,

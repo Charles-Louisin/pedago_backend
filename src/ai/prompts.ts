@@ -24,7 +24,8 @@ Chaque nœud doit indiquer les pages du document où il apparaît. Si le documen
 };
 
 export const WRITE_V1 = {
-  version: "write.v1",
+  // v2 : méthode de préparation officielle (validée dans l'admin) et rubriques propres à la méthode.
+  version: "write.v2",
   system: SYSTEM_CM,
   user: (args: {
     type: string;
@@ -38,6 +39,8 @@ export const WRITE_V1 = {
     illustrationLevel: string;
     language: "fr" | "en";
     sourceExcerpts: string;
+    /** Consignes de la méthode de préparation officielle validée (null : démarche générique). */
+    method?: string | null;
   }) => `Rédige une ressource de type "${args.type}" en ${args.language === "fr" ? "français" : "anglais"}.
 Classe : ${args.classLevel} (${args.subsystem}). Matière : ${args.subjectName}.
 Leçon : ${args.lessonTitle}. Durée : ${args.durationMin} min.
@@ -48,8 +51,16 @@ Illustrations : ${args.illustrationLevel} (décris chaque illustration en une ph
 Références officielles disponibles :
 ${args.sourceExcerpts || "<document>Aucun extrait fourni : reste strictement dans les objectifs ci-dessus.</document>"}
 
-Exigences :
-- Approche par compétences, démarche camerounaise (situation-problème, découverte, structuration, application, évaluation).
+${
+  args.method
+    ? `Méthode de préparation officielle à suivre STRICTEMENT (relue et validée par l'équipe pédagogique) :
+${args.method}
+Le déroulement (steps) reprend exactement ces étapes, dans cet ordre et avec ces noms. Chaque rubrique de la méthode est remplie.
+
+`
+    : ""
+}Exigences :
+- Approche par compétences${args.method ? ", selon la méthode ci-dessus" : ", démarche camerounaise (situation-problème, découverte, structuration, application, évaluation)"}.
 - Prévois une alternative sans électricité, sans projecteur, sans imprimante, avec des objets du quotidien.
 - Ajoute des conseils pour une classe nombreuse (souvent plus de 60 élèves).
 - Chaque question d'évaluation a un corrigé, un barème (points) et la compétence évaluée.
@@ -62,7 +73,8 @@ Réponds UNIQUEMENT en JSON avec ce schéma :
 "competency":"…","objectives":["…"],"prerequisites":["…"],"materials":["…"],"lowResourceAlternatives":["…"],"largeClassTips":["…"],
 "steps":[{"name":"…","durationMin":10,"teacherActivities":["…"],"learnerActivities":["…"]}],
 "writtenTrace":"…","exercises":[{"prompt":"…","answer":"…","explanation":"…","illustration":"…"}],
-"assessment":[{"prompt":"…","answer":"…","points":2,"competency":"…"}],"localContext":["…"]},
+"assessment":[{"prompt":"…","answer":"…","points":2,"competency":"…"}],"localContext":["…"]${args.method ? `,
+"extraSections":[{"label":"intitulé exact de la rubrique de la méthode","lines":["…"]}]` : ""}},
 "usedSourcePages":[{"sourceRef":"S1","pages":[3]}]}`,
 };
 

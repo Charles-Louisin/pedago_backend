@@ -31,6 +31,10 @@ const resourceSchema = new Schema(
     /** Empreinte de la demande de génération : évite de générer deux fois la même ressource. */
     generationKey: { type: String },
     aiJobId: { type: Schema.Types.ObjectId, ref: "AiJob" },
+    /** Méthode de préparation officielle suivie à la génération (et sa mise en page, figée pour le PDF). */
+    methodId: { type: Schema.Types.ObjectId, ref: "PreparationMethod" },
+    methodVersion: Number,
+    methodLayout: { type: Schema.Types.Mixed },
     aiReview: {
       score: Number,
       issues: [{ _id: false, severity: String, area: String, message: String }],

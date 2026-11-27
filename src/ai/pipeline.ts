@@ -18,10 +18,13 @@ import { htmlToText, isAllowedHost, safeFetch } from "./safe-fetch.js";
 import { deterministicChecks, lessonContentSchema } from "../services/content-schema.js";
 import { isStoredUrl, readStoredFile, storeFile } from "../services/storage.js";
 import { PROGRAM_IMPORT_STEPS, programImportHandlers } from "../services/program-import.js";
+import { METHOD_STEPS, methodHandlers } from "./method.js";
+import { methodBrief, methodFor, stepGaps } from "../services/methods.js";
 
 /* ───────────── Paramètres des tâches ───────────── */
 
-export const SOURCE_DOC_TYPES = ["curriculum", "law", "calendar", "textbook_list", "exam", "guide", "other"] as const;
+// lesson_template : fiche modèle d'une préparation (méthode à suivre), analysée comme un guide pédagogique.
+export const SOURCE_DOC_TYPES = ["curriculum", "law", "calendar", "textbook_list", "exam", "guide", "lesson_template", "other"] as const;
 export const researchParams = z.object({
   subsystem: z.enum(["francophone", "anglophone"]),
   classLevel: z.string().max(10).optional(),
@@ -72,6 +75,8 @@ export const STEPS: Record<AiJobKind, string[]> = {
   program_import: [...PROGRAM_IMPORT_STEPS],
   // Illustration d'une fiche demandée par l'enseignant : traitée immédiatement par l'API.
   teacher_illustration: ["generate"],
+  // Méthode de préparation lue dans un guide ou une fiche modèle : rangée « à valider », utilisée seulement validée.
+  analyze_method: [...METHOD_STEPS],
 };
 
 export function generationKey(p: {
@@ -83,6 +88,8 @@ export function generationKey(p: {
   difficulty: string;
   illustrationLevel: string;
   curriculumVersion: string;
+  /** Méthode de préparation suivie (« id@version », ou « none ») : une nouvelle méthode validée change la clé. */
+  method?: string;
 }) {
   const raw = [...Object.values(p), WRITE_V1.version, "schema.v1"].join("|");
   return crypto.createHash("sha256").update(raw).digest("hex");
@@ -114,6 +121,7 @@ const handlers: Record<string, (ctx: StepCtx) => Promise<StepResult>> = {
     const p = generateParams.parse(job.params);
     const node = await CurriculumNode.findById(p.nodeId).lean();
     if (!node) throw new Error("Nœud du référentiel introuvable");
+    const method = await methodFor({ subsystem: node.subsystem, classLevel: node.classLevel, subjectCode: node.subjectCode, type: p.type });
     const key = generationKey({
       subsystem: node.subsystem,
       classLevel: node.classLevel,
@@ -123,6 +131,7 @@ const handlers: Record<string, (ctx: StepCtx) => Promise<StepResult>> = {
       difficulty: p.difficulty,
       illustrationLevel: p.illustrationLevel,
       curriculumVersion: node.curriculumVersion,
+      method: method ? `${method._id}@${method.version}` : "none",
     });
     // Une ressource équivalente (même leçon, type et variante) suffit, même créée à la main ou par une ancienne version de prompt.
     const existing = await Resource.findOne({
@@ -146,8 +155,11 @@ const handlers: Record<string, (ctx: StepCtx) => Promise<StepResult>> = {
     const subject = await Subject.findOne({ subsystem: node.subsystem, code: node.subjectCode }).lean();
     const sourceIds = p.sourceIds.length ? p.sourceIds : (node.sourceRefs ?? []).map((s) => String(s.sourceId));
     const excerpts = await sourceExcerpts(sourceIds);
+    // Méthode de préparation officielle : déjà analysée, rangée et validée en base (jamais le texte brut du guide).
+    const method = await methodFor({ subsystem: node.subsystem, classLevel: node.classLevel, subjectCode: node.subjectCode, type: p.type });
     return {
       output: {
+        method: method ? { id: String(method._id), version: method.version, title: method.title, brief: methodBrief(method), layout: method.layout, steps: method.steps } : null,
         subsystem: node.subsystem,
         classLevel: node.classLevel,
         subjectCode: node.subjectCode,
@@ -187,6 +199,7 @@ const handlers: Record<string, (ctx: StepCtx) => Promise<StepResult>> = {
             illustrationLevel: p.illustrationLevel,
             language: c.subsystem === "anglophone" ? "en" : "fr",
             sourceExcerpts: c.excerpts,
+            method: c.method?.brief ?? null,
           }),
         },
       ],
@@ -199,6 +212,12 @@ const handlers: Record<string, (ctx: StepCtx) => Promise<StepResult>> = {
   async deterministic_checks({ outputs }) {
     const w = outputs.write;
     const issues = deterministicChecks(w.content, outputs.load_context.durationMin);
+    // Démarche officielle : chaque étape de la méthode validée doit figurer dans le déroulement.
+    const method = outputs.load_context.method as { title: string; steps: { name: string }[] } | null;
+    if (method) {
+      const missing = stepGaps(method, w.content.steps);
+      if (missing.length) issues.push({ severity: "error", area: "méthode", message: `Étapes de la méthode « ${method.title} » absentes du déroulement : ${missing.join(", ")}` });
+    }
     return { output: { issues } };
   },
 
@@ -265,6 +284,8 @@ const handlers: Record<string, (ctx: StepCtx) => Promise<StepResult>> = {
       curriculumVersion: c.curriculumVersion,
       origin: "ai",
       generationKey: outputs.check_cache.key,
+      // Méthode suivie : le PDF reprend son cartouche, ses rubriques et ses intitulés.
+      ...(c.method ? { methodId: c.method.id, methodVersion: c.method.version, methodLayout: c.method.layout } : {}),
       aiJobId: job._id,
       // Jamais publiée directement : passage obligatoire par la relecture humaine.
       status: "HUMAN_REVIEW",
@@ -475,6 +496,7 @@ Cherche d'abord sur : ${domains}.`,
 });
 
 Object.assign(handlers, programImportHandlers);
+Object.assign(handlers, methodHandlers);
 
 /** Candidats de la recherche → sources « à vérifier » (sites officiels de la liste blanche seulement, sans doublon). */
 export async function saveResearchCandidates(jobId: string, candidates: unknown[]) {

@@ -23,14 +23,21 @@ import {
   TeacherProfile,
   User,
   Session,
+  PreparationMethod,
+  METHOD_STATUSES,
+  subsystemOf,
+  type ClassLevel,
   type ResourceStatus,
 } from "../models/index.js";
 import { requireAuth, requireRole, type AuthedRequest } from "../middleware/auth.js";
 import { validate } from "../middleware/validate.js";
-import { ah, badRequest, forbidden, notFound } from "../utils/http-error.js";
+import { ah, badRequest, conflict, forbidden, notFound } from "../utils/http-error.js";
 import { lessonContentSchema, deterministicChecks } from "../services/content-schema.js";
 import { buildLibraryParams, extractParams, generateParams, researchParams, SOURCE_DOC_TYPES, STEPS } from "../ai/pipeline.js";
 import { reviewPdf } from "../services/exports.js";
+import { analyzeMethodParams } from "../ai/method.js";
+import { covers, pendingMethodsFor, type MethodDoc } from "../services/methods.js";
+import { lenientLayout } from "../services/layout.js";
 import { readStoredFile, storeFile } from "../services/storage.js";
 import { env } from "../config/env.js";
 import { isAllowedHost, isUploadThingUrl } from "../ai/safe-fetch.js";
@@ -92,7 +99,7 @@ const sourceSchema = z.object({
   fileKey: z.string().max(200).optional(),
   publishedOn: z.string().max(20).optional(),
   reference: z.string().max(200).optional(),
-  docType: z.enum(["curriculum", "law", "calendar", "textbook_list", "exam", "guide", "other"]).default("other"),
+  docType: z.enum(SOURCE_DOC_TYPES).default("other"),
   usageRights: z.enum(["public_official", "licensed", "reference_only", "unknown"]).default("unknown"),
   nextReviewOn: z.string().max(20).optional(),
   notes: z.string().max(2000).optional(),
@@ -572,6 +579,19 @@ adminRouter.post(
     checks.push({ level: "info", text: "Illustrations : celles des ressources existantes sont réutilisées ; la génération d'images de la bibliothèque n'est pas encore branchée (aucune prévue)." });
     if (avg === null) checks.push({ level: "info", text: "Pas encore d'historique de génération : seul le coût maximal est connu." });
 
+    // Méthode de préparation suivie par matière (validée en base) ; une méthode à valider bloque le lancement.
+    const validatedMethods = (await PreparationMethod.find({ subsystem: p.subsystem, status: "validated" }).sort({ validatedAt: -1 }).select("title classLevels subjectCodes resourceTypes subsystem version").lean()) as unknown as MethodDoc[];
+    const spec = (m: MethodDoc) => (m.subjectCodes.length ? 2 : 0) + (m.classLevels.length ? 1 : 0);
+    const methodBySubject = subjects.map((x) => {
+      const fit = validatedMethods.filter((m) => covers(m, { subsystem: p.subsystem, classLevel: p.classLevel, subjectCode: x.code, type: "lesson_plan" })).sort((a, b) => spec(b) - spec(a))[0];
+      return { subjectCode: x.code, name: x.name, method: fit ? { id: fit._id, title: fit.title } : null };
+    });
+    const pendingMethods = await pendingMethodsFor({ subsystem: p.subsystem, classLevel: p.classLevel, types: p.types });
+    if (pendingMethods.length) checks.unshift({ level: "warn", text: `Méthode de préparation à valider avant de lancer : ${pendingMethods.map((m) => `« ${m.title} »`).join(", ")} (page Méthodes).` });
+    const noMethod = methodBySubject.filter((x) => !x.method && bySubject.has(x.subjectCode));
+    if (p.types.includes("lesson_plan") && noMethod.length)
+      checks.push({ level: "warn", text: `Sans méthode officielle validée (démarche générique) : ${noMethod.map((x) => x.name).join(", ")}. Dépose le guide pédagogique ou une fiche modèle dans Sources, puis analyse-le.` });
+
     res.json({
       documents: docs.map((d) => ({ id: d._id, title: d.title, issuer: d.issuer, status: d.status, docType: d.docType, publishedOn: d.publishedOn ?? null })),
       sources: { verified: allSources.find((x) => x._id === "verified")?.n ?? 0, toVerify: allSources.filter((x) => x._id !== "verified" && x._id !== "rejected").reduce((n, x) => n + x.n, 0) },
@@ -582,8 +602,166 @@ adminRouter.post(
       illustrations: { planned: 0, reusable: illustrationsReady },
       cost: { avgPerResourceUsd: avg, estimateUsd: avg === null ? null : Math.round(avg * capped * 100) / 100, maxUsd: Math.round(p.perJobBudgetUsd * capped * 100) / 100, basedOn: past[0]?.n ?? 0 },
       checks,
+      methods: { bySubject: methodBySubject, pending: pendingMethods.map((m) => ({ id: m._id, title: m.title })) },
       referenceYear: p.referenceYear ?? null,
     });
+  })
+);
+
+/* ───────────── Méthodes de préparation (guides pédagogiques, fiches modèles) ───────────── */
+
+const methodEdit = z.object({
+  title: z.string().trim().min(2).max(200).optional(),
+  classLevels: z.array(z.enum(ALL_CLASS_LEVELS as unknown as [string, ...string[]])).max(12).optional(),
+  subjectCodes: z.array(z.string().trim().min(1).max(10)).max(30).optional(),
+  resourceTypes: z.array(z.enum(RESOURCE_TYPES)).min(1).max(RESOURCE_TYPES.length).optional(),
+  layout: z.unknown().optional(),
+  sectionGuidance: z.array(z.object({ label: z.string().trim().min(1).max(120), guidance: z.string().trim().max(600) })).max(20).optional(),
+  steps: z
+    .array(
+      z.object({
+        name: z.string().trim().min(2).max(160),
+        purpose: z.string().trim().max(400).optional(),
+        durationMin: z.number().int().min(1).max(120).nullish(),
+        teacherRole: z.string().trim().max(400).optional(),
+        learnerRole: z.string().trim().max(400).optional(),
+      })
+    )
+    .max(12)
+    .optional(),
+  extraSections: z.array(z.object({ label: z.string().trim().min(1).max(120), guidance: z.string().trim().max(600).optional() })).max(10).optional(),
+  conventions: z.array(z.string().trim().min(2).max(400)).max(20).optional(),
+});
+
+adminRouter.get(
+  "/methods",
+  validate(z.object({ status: z.enum(METHOD_STATUSES).optional(), subsystem: z.enum(["francophone", "anglophone"]).optional() }), "query"),
+  ah(async (req, res) => {
+    const q = req.query as { status?: string; subsystem?: string };
+    const filter: Record<string, unknown> = {};
+    if (q.status) filter.status = q.status;
+    if (q.subsystem) filter.subsystem = q.subsystem;
+    const items = await PreparationMethod.find(filter).sort({ status: 1, updatedAt: -1 }).populate("sourceId", "title issuer docType").lean();
+    res.json({ items });
+  })
+);
+
+adminRouter.get(
+  "/methods/:id",
+  validate(z.object({ id: objectId }), "params"),
+  ah(async (req, res) => {
+    const m = await PreparationMethod.findById(req.params.id).populate("sourceId", "title issuer docType").lean();
+    if (!m) throw notFound();
+    const used = await Resource.countDocuments({ methodId: m._id });
+    res.json({ ...m, usedByResources: used });
+  })
+);
+
+/** Correction humaine de l'analyse. Une méthode validée modifiée repasse « à valider » (nouvelle version). */
+adminRouter.patch(
+  "/methods/:id",
+  validate(z.object({ id: objectId }), "params"),
+  validate(methodEdit),
+  ah(async (req, res) => {
+    const m = await PreparationMethod.findById(req.params.id);
+    if (!m) throw notFound();
+    if (m.status === "retired") throw badRequest("RETIRED", "Méthode retirée : relance une analyse de la source");
+    const b = req.body as z.infer<typeof methodEdit>;
+    if (b.layout !== undefined) {
+      const layout = lenientLayout(b.layout);
+      if (!layout) throw badRequest("BAD_LAYOUT", "Mise en page illisible : garde au moins une rubrique");
+      m.layout = layout;
+    }
+    if (b.title) m.title = b.title;
+    if (b.classLevels) m.classLevels = b.classLevels;
+    if (b.subjectCodes) {
+      const known = new Set((await Subject.find({ subsystem: m.subsystem }).select("code").lean()).map((s) => s.code));
+      const bad = b.subjectCodes.filter((c) => !known.has(c));
+      if (bad.length) throw badRequest("BAD_SUBJECT", `Matières inconnues pour ce sous-système : ${bad.join(", ")}`);
+      m.subjectCodes = b.subjectCodes;
+    }
+    if (b.resourceTypes) m.resourceTypes = b.resourceTypes;
+    if (b.sectionGuidance) m.set("sectionGuidance", b.sectionGuidance);
+    if (b.steps) m.set("steps", b.steps.map((s) => ({ ...s, durationMin: s.durationMin ?? undefined })));
+    if (b.extraSections) m.set("extraSections", b.extraSections);
+    if (b.conventions) m.conventions = b.conventions;
+    if (m.status === "validated") {
+      m.status = "extracted";
+      m.validatedAt = undefined;
+      m.validatedBy = undefined;
+    }
+    m.version = (m.version ?? 1) + 1;
+    await m.save();
+    await audit(req, "method.update", String(m._id), { version: m.version });
+    res.json(m);
+  })
+);
+
+/**
+ * Validation humaine : la méthode devient celle que suit la génération. Une méthode validée plus ancienne,
+ * de même portée exacte, est retirée (une seule méthode fait foi pour une portée donnée).
+ */
+adminRouter.post(
+  "/methods/:id/validate",
+  validate(z.object({ id: objectId }), "params"),
+  ah(async (req, res) => {
+    const m = await PreparationMethod.findById(req.params.id);
+    if (!m) throw notFound();
+    if (m.status !== "extracted") throw badRequest("BAD_STATUS", "Seule une méthode à valider peut être validée");
+    const layout = m.layout as { sections?: unknown[] } | null;
+    if (!layout?.sections?.length && !m.steps.length) throw badRequest("EMPTY_METHOD", "Méthode vide : ni rubriques ni étapes");
+    const sameScope = (a: string[], b: string[]) => [...a].sort().join(",") === [...b].sort().join(",");
+    const others = await PreparationMethod.find({ _id: { $ne: m._id }, subsystem: m.subsystem, status: "validated" });
+    const replaced = others.filter((o) => sameScope(o.classLevels, m.classLevels) && sameScope(o.subjectCodes, m.subjectCodes) && sameScope(o.resourceTypes, m.resourceTypes));
+    for (const o of replaced) {
+      o.status = "retired";
+      await o.save();
+    }
+    m.status = "validated";
+    m.validatedAt = new Date();
+    m.validatedBy = me(req).userId as any;
+    await m.save();
+    await audit(req, "method.validate", String(m._id), { replaced: replaced.map((o) => String(o._id)) });
+    res.json({ method: m, replaced: replaced.length });
+  })
+);
+
+adminRouter.post(
+  "/methods/:id/retire",
+  validate(z.object({ id: objectId }), "params"),
+  ah(async (req, res) => {
+    const m = await PreparationMethod.findById(req.params.id);
+    if (!m) throw notFound();
+    m.status = "retired";
+    await m.save();
+    await audit(req, "method.retire", String(m._id));
+    res.json(m);
+  })
+);
+
+/** Méthode qui serait suivie pour une classe et une matière (page Usine IA) : validée, à valider, ou aucune. */
+adminRouter.get(
+  "/methods-applicable",
+  validate(
+    z.object({
+      classLevel: z.enum(ALL_CLASS_LEVELS as unknown as [string, ...string[]]),
+      subjectCode: z.string().max(10).optional(),
+      type: z.enum(RESOURCE_TYPES).default("lesson_plan"),
+    }),
+    "query"
+  ),
+  ah(async (req, res) => {
+    const q = req.query as { classLevel: string; subjectCode?: string; type: string };
+    const subsystem = subsystemOf(q.classLevel as ClassLevel);
+    const subjects = q.subjectCode ? [q.subjectCode] : (await Subject.find({ subsystem }).select("code").lean()).map((s) => s.code);
+    const validated = (await PreparationMethod.find({ subsystem, status: "validated" }).sort({ validatedAt: -1 }).select("title classLevels subjectCodes resourceTypes subsystem version").lean()) as unknown as MethodDoc[];
+    const spec = (m: MethodDoc) => (m.subjectCodes.length ? 2 : 0) + (m.classLevels.length ? 1 : 0);
+    const bySubject = subjects.map((code) => {
+      const fit = validated.filter((m) => covers(m, { subsystem, classLevel: q.classLevel, subjectCode: code, type: q.type })).sort((a, b) => spec(b) - spec(a))[0];
+      return { subjectCode: code, method: fit ? { id: fit._id, title: fit.title, version: fit.version } : null };
+    });
+    const pending = await pendingMethodsFor({ subsystem, classLevel: q.classLevel, subjectCode: q.subjectCode, types: [q.type] });
+    res.json({ subsystem, bySubject, pending: pending.map((m) => ({ id: m._id, title: m.title })) });
   })
 );
 
@@ -596,7 +774,31 @@ const jobSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("review_resource"), params: z.object({ resourceId: objectId }), budgetUsd: z.number().min(0.05).max(5).optional() }),
   // Recherche de documents officiels : les candidats trouvés restent « à vérifier » dans Sources.
   z.object({ kind: z.literal("research_sources"), params: researchParams, budgetUsd: z.number().min(0.05).max(2).optional() }),
+  // Méthode de préparation d'un guide pédagogique ou d'une fiche modèle : rangée « à valider » (page Méthodes).
+  z.object({ kind: z.literal("analyze_method"), params: analyzeMethodParams, budgetUsd: z.number().min(0.05).max(5).optional() }),
 ]);
+
+/**
+ * Une méthode de préparation qui toucherait cette génération attend encore sa relecture : on ne lance rien,
+ * sinon les leçons partiraient avec l'ancienne démarche (et il faudrait les refaire).
+ */
+async function assertMethodsReady(body: z.infer<typeof jobSchema>) {
+  let target: { subsystem: string; classLevel?: string; subjectCode?: string; types: string[] } | null = null;
+  if (body.kind === "generate_resource") {
+    const node = await CurriculumNode.findById(body.params.nodeId).select("subsystem classLevel subjectCode").lean();
+    if (node) target = { subsystem: node.subsystem, classLevel: node.classLevel, subjectCode: node.subjectCode, types: [body.params.type] };
+  } else if (body.kind === "build_library") {
+    target = { subsystem: subsystemOf(body.params.classLevel as ClassLevel), classLevel: body.params.classLevel, subjectCode: body.params.subjectCode, types: body.params.types };
+  }
+  if (!target) return;
+  const [pending, analyzing] = await Promise.all([
+    pendingMethodsFor(target),
+    AiJob.countDocuments({ kind: "analyze_method", "params.subsystem": target.subsystem, status: { $in: ["queued", "running"] } }),
+  ]);
+  if (analyzing) throw conflict("METHOD_ANALYZING", "Une méthode de préparation est en cours d'analyse : attends la fin de l'analyse et valide-la (page Méthodes) avant de générer.");
+  if (pending.length)
+    throw conflict("METHOD_PENDING", `Méthode de préparation à valider avant de générer : ${pending.map((m) => `« ${m.title} »`).join(", ")} (page Méthodes).`);
+}
 
 adminRouter.post(
   "/ai/jobs",
@@ -605,6 +807,12 @@ adminRouter.post(
   ah(async (req, res) => {
     const body = req.body as z.infer<typeof jobSchema>;
     if (!env.openrouterApiKey) throw badRequest("AI_NOT_CONFIGURED", "Clé OpenRouter non configurée : aucune tâche IA ne peut être lancée");
+    await assertMethodsReady(body);
+    if (body.kind === "analyze_method") {
+      const src = await SourceDocument.findById(body.params.sourceId).select("docType").lean();
+      if (!src) throw notFound("Source introuvable");
+      if (src.docType !== "guide" && src.docType !== "lesson_template") throw badRequest("NOT_A_GUIDE", "Seuls un guide pédagogique ou une fiche modèle contiennent une méthode de préparation");
+    }
     const job = await AiJob.create({
       kind: body.kind,
       params: body.params,

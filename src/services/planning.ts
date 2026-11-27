@@ -81,14 +81,19 @@ export async function ensurePlan(teacherId: string, classLevel: string, schoolYe
     // Progression de l'enseignant si elle existe pour la matière, sinon programme officiel.
     lessonsFor(teacherId, classLevel, subjects),
     // Les leçons déjà attribuées (hors annulées) ne sont pas redistribuées.
-    LessonInstance.find({ teacherId, classLevel, origin: "plan", status: { $ne: "cancelled" } }).select("nodeId -_id").lean(),
+    LessonInstance.find({ teacherId, classLevel, origin: "plan", status: { $ne: "cancelled" } }).select("nodeId subjectCode createdAt -_id").lean(),
   ]);
   const taken = new Set(existing.map((l) => `${l.date}|${l.start}`));
-  const plannedSet = new Set(plannedRows.map((r) => String(r.nodeId)));
-
   const cursors = new Map<string, { nodes: { _id: unknown }[]; next: number }>();
   for (const subjectCode of subjects) {
-    const nodes = (bySubject.get(subjectCode)?.nodes ?? []).filter((n) => !(n as { alreadyTaught?: boolean }).alreadyTaught);
+    const entry = bySubject.get(subjectCode);
+    const nodes = (entry?.nodes ?? []).filter((n) => !n.alreadyTaught);
+    // Avec une position « Où j'en suis », seules les séances créées depuis comptent : la file reprend à la leçon choisie,
+    // même si elle avait déjà été placée (et non faite) avant le réglage.
+    const since = entry?.position?.setAt ? new Date(entry.position.setAt).getTime() : 0;
+    const plannedSet = new Set(
+      plannedRows.filter((r) => r.subjectCode === subjectCode && (!since || (r.createdAt ? new Date(r.createdAt).getTime() >= since : false))).map((r) => String(r.nodeId))
+    );
     const firstFree = nodes.findIndex((n) => !plannedSet.has(String(n._id)));
     cursors.set(subjectCode, { nodes, next: firstFree === -1 ? nodes.length : firstFree });
   }
