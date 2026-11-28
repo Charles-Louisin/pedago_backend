@@ -19,6 +19,8 @@ import { METHOD_STEPS } from "./method.js";
 export const ingestParams = z.object({ sourceId: z.string().regex(/^[a-f\d]{24}$/i) });
 export const INGEST_STEPS = ["ingest_read", "ingest_identify"] as const;
 const INGEST_V1 = "ingest.v1";
+// v2 : leçons regroupées par chemin (réponse plus courte), passage redécoupé si la réponse est coupée.
+const INGEST_V2 = "ingest.v2";
 /** Taille d'un morceau envoyé au modèle (caractères), et recouvrement d'une page entre deux morceaux. */
 const CHUNK_CHARS = 24_000;
 const PAGE_MARK = (n: number) => `\n\n[[page ${n}]]\n`;
@@ -121,6 +123,113 @@ const chunkSchema = z.object({
     .max(250),
 });
 
+/* ───────── Extraction d'un passage (format compact, redécoupage si la réponse est trop longue) ───────── */
+
+type Part = { kind: "pages"; from: number; to: number } | { kind: "chars"; start: number; end: number };
+type Idf = { subsystem: "francophone" | "anglophone"; classes: string[]; subjects: { code: string; name: string }[]; version: string };
+
+/** Réponse du modèle : leçons regroupées par matière, classes et chemin (le chemin n'est pas répété). */
+const groupSchema = z.object({
+  groups: z
+    .array(
+      z.object({
+        subject: z.string().trim().min(2).max(120),
+        classes: z.array(z.string()).min(1),
+        path: z.array(pathItem).max(4).nullish().transform((v) => v ?? []),
+        lessons: z
+          .array(
+            z.object({
+              title: z.string().trim().min(2).max(240),
+              objectives: z.array(z.string().trim().min(2).max(400)).max(15).nullish().transform((v) => v ?? []),
+              durationMin: z.number().int().min(5).max(240).nullish(),
+              term: z.number().int().min(1).max(3).nullish(),
+              week: z.number().int().min(1).max(60).nullish(),
+              period: z.string().trim().max(80).nullish(),
+              pages: z.array(z.number().int().min(0)).max(10).nullish().transform((v) => v ?? []),
+            })
+          )
+          .max(120),
+      })
+    )
+    .max(80),
+});
+
+/** Réponse illisible parce que coupée (limite de longueur du modèle) : le passage doit être redécoupé. */
+class TooLongError extends Error {}
+
+function textOf(full: string, part: Part) {
+  if (part.kind === "chars") return full.slice(part.start, part.end);
+  const a = full.indexOf(PAGE_MARK(part.from));
+  const b = full.indexOf(PAGE_MARK(part.to + 1));
+  return full.slice(a < 0 ? 0 : a, b < 0 ? undefined : b);
+}
+
+function halves(part: Part): [Part, Part] | null {
+  if (part.kind === "pages") {
+    if (part.to <= part.from) return null;
+    const mid = Math.floor((part.from + part.to) / 2);
+    return [{ kind: "pages", from: part.from, to: mid }, { kind: "pages", from: mid + 1, to: part.to }];
+  }
+  if (part.end - part.start < 4_000) return null;
+  const mid = Math.floor((part.start + part.end) / 2);
+  return [{ kind: "chars", start: part.start, end: mid + 500 }, { kind: "chars", start: mid - 500, end: part.end }];
+}
+
+export async function extractPart(jobId: string, idf: Idf, full: string, part: Part, depth: number, stats: { calls: number; splits: number }): Promise<z.infer<typeof chunkSchema>["items"]> {
+  const text = textOf(full, part);
+  if (text.replace(/\[\[page \d+\]\]/g, "").trim().length < 80) return [];
+  const where = part.kind === "pages" ? `pages ${part.from} à ${part.to}` : "un passage";
+  stats.calls++;
+  const { text: out } = await chat({
+    jobId,
+    step: "ingest_chunk",
+    model: env.aiModelExtract,
+    promptVersion: INGEST_V2,
+    json: true,
+    temperature: 0,
+    maxTokens: 32_000,
+    messages: [
+      { role: "system", content: SYSTEM },
+      {
+        role: "user",
+        content: `Extrait d'un programme officiel (${idf.subsystem}), ${where}.
+Classes du document : ${idf.classes.join(", ")}. Matières du document : ${idf.subjects.map((s) => s.name).join(" ; ")}.
+Relève chaque leçon (ou contenu d'apprentissage enseigné en une séance) présente dans ce passage, REGROUPÉES par chemin :
+- un groupe = une matière (recopiée EXACTEMENT parmi les matières du document), ses classes (codes ci-dessus) et son chemin
+  du plus large au plus précis, avec les intitulés exacts : {"kind": "domain" (domaine, centre d'intérêt), "competency"
+  (compétence), "unit" (unité, séquence, module, thème), "title": "…", "label": "Unité 3" ou "Séquence 2" si écrit} ;
+- dans le groupe, ses leçons dans l'ordre : {"title", "objectives" (objectifs écrits, 5 au plus, tels qu'écrits),
+  "durationMin" (si écrite), "term" (trimestre 1-3 si écrit), "week", "period", "pages" (numéros [[page N]])}.
+Une leçon commune à plusieurs classes n'apparaît qu'une fois, avec toutes ses classes. N'écris pas les champs vides inutiles.
+Ignore sommaire, préface, textes officiels et généralités sans contenu de leçon. Sans aucune leçon, renvoie {"groups": []}.
+Réponds UNIQUEMENT en JSON : {"groups":[{"subject":"…","classes":["…"],"path":[{"kind":"unit","title":"…","label":null}],
+"lessons":[{"title":"…","objectives":["…"],"pages":[1]}]}]}
+<document>${text}</document>`,
+      },
+    ],
+  });
+  try {
+    let raw: unknown;
+    try {
+      raw = parseJson(out);
+    } catch {
+      throw new TooLongError("Réponse coupée");
+    }
+    const g = groupSchema.parse(raw);
+    return g.groups.flatMap((grp) =>
+      grp.lessons.map(({ pages, ...lesson }) => ({ classes: grp.classes, subject: grp.subject, path: grp.path, lesson, pages }))
+    );
+  } catch (err) {
+    const split = depth < 4 ? halves(part) : null;
+    if (err instanceof TooLongError && split) {
+      stats.splits++;
+      const [a, b] = split;
+      return [...(await extractPart(jobId, idf, full, a, depth + 1, stats)), ...(await extractPart(jobId, idf, full, b, depth + 1, stats))];
+    }
+    throw err instanceof TooLongError ? new Error(`Passage trop dense même découpé (${where}) : réponse du modèle incomplète`) : err;
+  }
+}
+
 export const ingestHandlers = {
   /** Lecture page par page, découpage en morceaux, ajout des étapes d'extraction. Aucun appel IA. */
   async ingest_read({ job }: Ctx) {
@@ -202,7 +311,11 @@ Réponds UNIQUEMENT en JSON :
     return { output: { subsystem: id.subsystem, classes, subjects, containsMethod: Boolean(id.containsPreparationMethod), version, warnings: id.warnings } };
   },
 
-  /** Un morceau de pages : leçons et leur chemin, rangées aussitôt dans le référentiel (« à valider »). */
+  /**
+   * Un morceau de pages : leçons et leur chemin, rangées aussitôt dans le référentiel (« à valider »).
+   * Réponse compacte (leçons regroupées par chemin). Si la réponse dépasse quand même la limite du modèle
+   * (passage très dense : JSON coupé), le passage est redécoupé en deux et refait, sans rien perdre.
+   */
   async ingest_chunk({ job, outputs }: Ctx) {
     const p = ingestParams.parse(job.params);
     const index = job.steps.slice(0, job.currentStep).filter((s) => s.name === "ingest_chunk").length;
@@ -210,46 +323,11 @@ Réponds UNIQUEMENT en JSON :
     const idf = outputs.ingest_identify as { subsystem: "francophone" | "anglophone"; classes: string[]; subjects: { code: string; name: string }[]; version: string };
     const src = await SourceDocument.findById(p.sourceId).select("+extractedText").lean();
     const full = src?.extractedText ?? "";
-    let text: string;
-    if (chunk.start !== undefined) text = full.slice(chunk.start, chunk.end);
-    else {
-      const a = full.indexOf(PAGE_MARK(chunk.from));
-      const b = full.indexOf(PAGE_MARK(chunk.to + 1));
-      text = full.slice(a < 0 ? 0 : a, b < 0 ? undefined : b);
-    }
-    if (text.replace(/\[\[page \d+\]\]/g, "").trim().length < 80) return { output: { items: 0, chunk: index } };
-
-    const { text: out } = await chat({
-      jobId: String(job._id),
-      step: "ingest_chunk",
-      model: env.aiModelExtract,
-      promptVersion: INGEST_V1,
-      json: true,
-      temperature: 0,
-      maxTokens: 14_000,
-      messages: [
-        { role: "system", content: SYSTEM },
-        {
-          role: "user",
-          content: `Extrait d'un programme officiel (${idf.subsystem}), pages ${chunk.from || "?"} à ${chunk.to || "?"}.
-Classes du document : ${idf.classes.join(", ")}. Matières du document : ${idf.subjects.map((s) => s.name).join(" ; ")}.
-Relève chaque leçon (ou contenu d'apprentissage à enseigner en une séance) présente dans ce passage :
-- "classes" : la ou les classes concernées (codes ci-dessus) ;
-- "subject" : la matière, recopiée EXACTEMENT parmi les matières du document ;
-- "path" : son chemin du plus large au plus précis, avec les intitulés exacts : {"kind": "domain" (domaine, centre d'intérêt),
-  "competency" (compétence), "unit" (unité, séquence, module, thème), "title": "…", "label": "Unité 3" ou "Séquence 2" si écrit} ;
-- "lesson" : {"title", "objectives" (objectifs écrits), "durationMin" (si écrite), "term" (trimestre 1-3 si écrit), "week", "period"} ;
-- "pages" : numéros des pages ([[page N]]).
-Ignore sommaire, préface, textes officiels et généralités sans contenu de leçon. Si le passage n'a aucune leçon, renvoie {"items": []}.
-Réponds UNIQUEMENT en JSON : {"items":[{"classes":["…"],"subject":"…","path":[{"kind":"unit","title":"…","label":null}],
-"lesson":{"title":"…","objectives":["…"],"durationMin":null,"term":null,"week":null,"period":null},"pages":[1]}]}
-<document>${text}</document>`,
-        },
-      ],
-    });
-    const parsed = chunkSchema.parse(parseJson(out));
-    const saved = await storeChunkItems(String(src!._id), idf, parsed.items);
-    return { output: { chunk: index, items: parsed.items.length, saved } };
+    const part: Part = chunk.start !== undefined ? { kind: "chars", start: chunk.start, end: chunk.end! } : { kind: "pages", from: chunk.from, to: chunk.to };
+    const stats = { calls: 0, splits: 0 };
+    const items = await extractPart(String(job._id), idf, full, part, 0, stats);
+    const saved = await storeChunkItems(String(src!._id), idf, items);
+    return { output: { chunk: index, items: items.length, saved, calls: stats.calls, splits: stats.splits } };
   },
 
   /** Bilan sur la source ; un canevas de fiche dans le document part en analyse de méthode. */
@@ -340,6 +418,19 @@ export async function storeChunkItems(
 export async function startIngest(sourceId: string, createdBy: unknown) {
   const running = await AiJob.findOne({ kind: "ingest_curriculum", "params.sourceId": sourceId, status: { $in: ["queued", "running"] } }).select("_id").lean();
   if (running) return running._id;
+  // Analyse interrompue (erreur, budget, annulation) : on la reprend à la partie qui a échoué, sans refaire
+  // (ni repayer) les parties déjà faites. Une analyse terminée est, elle, refaite de zéro (« Réanalyser »).
+  const stopped = await AiJob.findOne({ kind: "ingest_curriculum", "params.sourceId": sourceId }).sort({ createdAt: -1 });
+  if (stopped && ["failed", "budget_exceeded", "cancelled"].includes(stopped.status)) {
+    for (const s of stopped.steps) if (s.status !== "done" && s.status !== "skipped") { s.status = "pending"; s.attempts = 0; s.error = undefined; }
+    if (stopped.status === "budget_exceeded") stopped.budgetUsd += env.aiJobDefaultBudgetUsd;
+    stopped.status = "queued";
+    stopped.lastError = undefined;
+    stopped.nextRunAt = new Date();
+    await stopped.save();
+    await SourceDocument.updateOne({ _id: sourceId }, { $set: { "extraction.status": "running", "extraction.jobId": stopped._id } });
+    return stopped._id;
+  }
   const job = await AiJob.create({
     kind: "ingest_curriculum",
     params: { sourceId },

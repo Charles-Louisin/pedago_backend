@@ -270,7 +270,10 @@ export async function seedDatabase(opts: { demo?: boolean } = {}) {
         slots.push({ weekday: wd, start: "09:00", end: "10:00", subjectCode: "FR" });
         if (wd % 2 === 1) slots.push({ weekday: wd, start: "10:30", end: "11:30", subjectCode: "SCI" });
       }
-      await Timetable.create({ teacherId: user._id, classLevel: "CP", schoolYear: "2026-2027", slots });
+      const tt = await Timetable.create({ teacherId: user._id, classLevel: "CP", schoolYear: "2026-2027", slots });
+      // Emploi du temps de démonstration daté de la rentrée : l'app ne planifie jamais avant la création de
+      // l'emploi du temps, et les tests interrogent des semaines fixes de l'année (sinon ils dépendent du jour).
+      await Timetable.collection.updateOne({ _id: tt._id }, { $set: { createdAt: new Date("2026-09-01T00:00:00Z") } });
     }
   }
   // Rattrapage des tailles de contenu pour les ressources créées avant ce champ.
