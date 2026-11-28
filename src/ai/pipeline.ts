@@ -19,6 +19,7 @@ import { deterministicChecks, lessonContentSchema } from "../services/content-sc
 import { isStoredUrl, readStoredFile, storeFile } from "../services/storage.js";
 import { PROGRAM_IMPORT_STEPS, programImportHandlers } from "../services/program-import.js";
 import { METHOD_STEPS, methodHandlers } from "./method.js";
+import { INGEST_STEPS, ingestHandlers } from "./ingest.js";
 import { methodBrief, methodFor, stepGaps } from "../services/methods.js";
 
 /* ───────────── Paramètres des tâches ───────────── */
@@ -77,6 +78,8 @@ export const STEPS: Record<AiJobKind, string[]> = {
   teacher_illustration: ["generate"],
   // Méthode de préparation lue dans un guide ou une fiche modèle : rangée « à valider », utilisée seulement validée.
   analyze_method: [...METHOD_STEPS],
+  // Programme officiel déposé : lu, identifié puis extrait morceau par morceau (étapes ajoutées en cours de route).
+  ingest_curriculum: [...INGEST_STEPS],
 };
 
 export function generationKey(p: {
@@ -497,6 +500,7 @@ Cherche d'abord sur : ${domains}.`,
 
 Object.assign(handlers, programImportHandlers);
 Object.assign(handlers, methodHandlers);
+Object.assign(handlers, ingestHandlers);
 
 /** Candidats de la recherche → sources « à vérifier » (sites officiels de la liste blanche seulement, sans doublon). */
 export async function saveResearchCandidates(jobId: string, candidates: unknown[]) {

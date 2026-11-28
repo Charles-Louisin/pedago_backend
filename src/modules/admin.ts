@@ -36,6 +36,7 @@ import { lessonContentSchema, deterministicChecks } from "../services/content-sc
 import { buildLibraryParams, extractParams, generateParams, researchParams, SOURCE_DOC_TYPES, STEPS } from "../ai/pipeline.js";
 import { reviewPdf } from "../services/exports.js";
 import { analyzeMethodParams } from "../ai/method.js";
+import { startIngest } from "../ai/ingest.js";
 import { covers, pendingMethodsFor, type MethodDoc } from "../services/methods.js";
 import { lenientLayout } from "../services/layout.js";
 import { readStoredFile, storeFile } from "../services/storage.js";
@@ -115,7 +116,24 @@ adminRouter.get(
       SourceDocument.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
       SourceDocument.countDocuments(filter),
     ]);
-    res.json({ items, total });
+    // Avancement de l'analyse de chaque programme (étapes faites / prévues, erreur éventuelle).
+    const jobIds = items.map((s) => s.extraction?.jobId).filter(Boolean);
+    const jobs = await AiJob.find({ _id: { $in: jobIds } }).select("status steps.name steps.status lastError spentUsd").lean();
+    const byId = new Map(jobs.map((j) => [String(j._id), j]));
+    res.json({
+      items: items.map((s) => {
+        const j = s.extraction?.jobId ? byId.get(String(s.extraction.jobId)) : null;
+        const chunks = j?.steps.filter((x) => x.name === "ingest_chunk") ?? [];
+        const failed = j && (j.status === "failed" || j.status === "budget_exceeded" || j.status === "cancelled");
+        return {
+          ...s,
+          ingest: j
+            ? { status: failed ? "failed" : s.extraction?.status === "done" ? "done" : "running", chunksDone: chunks.filter((x) => x.status === "done").length, chunks: chunks.length, error: failed ? j.lastError ?? j.status : null, spentUsd: j.spentUsd }
+            : null,
+        };
+      }),
+      total,
+    });
   })
 );
 
@@ -140,7 +158,87 @@ adminRouter.patch(
     const doc = await SourceDocument.findByIdAndUpdate(req.params.id, req.body, { new: true }).lean();
     if (!doc) throw notFound();
     await audit(req, "source.update", String(doc._id), req.body);
-    res.json(doc);
+    // Programme vérifié par un humain : son analyse part aussitôt (classes, matières, unités, leçons).
+    let ingest: string | null = null;
+    if (req.body.status === "verified" && doc.docType === "curriculum" && doc.extraction?.status !== "done") {
+      if (!env.openrouterApiKey) ingest = "AI_NOT_CONFIGURED";
+      else ingest = String(await startIngest(String(doc._id), me(req).userId));
+    }
+    res.json({ ...doc, ingestJobId: ingest });
+  })
+);
+
+/**
+ * Avancement détaillé de l'analyse d'un programme (fenêtre de suivi du tableau de bord) : étape en cours,
+ * chaque partie du document (pages, état, leçons rangées), ce qui est déjà trouvé, temps et coût.
+ */
+adminRouter.get(
+  "/sources/:id/progress",
+  validate(z.object({ id: objectId }), "params"),
+  ah(async (req, res) => {
+    const src = await SourceDocument.findById(req.params.id).select("title pageCount extraction").lean();
+    if (!src) throw notFound();
+    const job = src.extraction?.jobId
+      ? await AiJob.findById(src.extraction.jobId).lean()
+      : await AiJob.findOne({ kind: "ingest_curriculum", "params.sourceId": String(src._id) }).sort({ createdAt: -1 }).lean();
+    if (!job) return res.json({ title: src.title, status: "none" });
+
+    const steps = job.steps as { name: string; status: string; output?: any; startedAt?: Date; finishedAt?: Date; error?: string }[];
+    const read = steps.find((s) => s.name === "ingest_read");
+    const identify = steps.find((s) => s.name === "ingest_identify");
+    const chunkSteps = steps.filter((s) => s.name === "ingest_chunk");
+    const finish = steps.find((s) => s.name === "ingest_finish");
+    const plan = (read?.output?.chunks ?? []) as { from: number; to: number }[];
+    const failed = ["failed", "budget_exceeded", "cancelled"].includes(job.status);
+    const done = !failed && (job.status === "waiting_review" || job.status === "done");
+
+    // Durée moyenne d'une partie terminée : estimation du temps restant.
+    const durations = chunkSteps.filter((s) => s.status === "done" && s.startedAt && s.finishedAt).map((s) => +new Date(s.finishedAt!) - +new Date(s.startedAt!));
+    const avg = durations.length ? durations.reduce((a, b) => a + b, 0) / durations.length : null;
+    const remaining = chunkSteps.filter((s) => s.status !== "done").length;
+
+    const stage = failed ? "failed" : done ? "done" : read?.status !== "done" ? "read" : identify?.status !== "done" ? "identify" : finish?.status === "running" ? "finish" : "chunks";
+    const count = (kind: string) => CurriculumNode.countDocuments({ ownerId: null, "sourceRefs.sourceId": src._id, kind });
+    const [units, lessons, competencies, domains] = await Promise.all([count("unit"), count("lesson"), count("competency"), count("domain")]);
+    const subjects = await CurriculumNode.distinct("subjectCode", { ownerId: null, "sourceRefs.sourceId": src._id, kind: "lesson" });
+
+    res.json({
+      title: src.title,
+      status: failed ? "failed" : done ? "done" : "running",
+      stage,
+      error: failed ? job.lastError ?? job.status : null,
+      startedAt: job.createdAt,
+      updatedAt: job.updatedAt,
+      spentUsd: job.spentUsd,
+      budgetUsd: job.budgetUsd,
+      pages: read?.output?.pages ?? src.pageCount ?? null,
+      identified: identify?.output ? { subsystem: identify.output.subsystem, classes: identify.output.classes, subjects: identify.output.subjects, containsMethod: identify.output.containsMethod } : null,
+      chunks: plan.map((c, i) => ({
+        index: i + 1,
+        from: c.from,
+        to: c.to,
+        status: chunkSteps[i]?.status ?? "pending",
+        saved: chunkSteps[i]?.output?.saved ?? null,
+      })),
+      found: { domains, competencies, units, lessons, subjectsWithLessons: subjects.length },
+      etaMs: !done && !failed && avg !== null ? Math.round(avg * remaining) : null,
+    });
+  })
+);
+
+/** Lance (ou relance) l'analyse complète d'un programme : classes, matières, unités et leçons, sans rien choisir. */
+adminRouter.post(
+  "/sources/:id/ingest",
+  validate(z.object({ id: objectId }), "params"),
+  ah(async (req, res) => {
+    if (!env.openrouterApiKey) throw badRequest("AI_NOT_CONFIGURED", "Clé OpenRouter non configurée : l'analyse ne peut pas être lancée");
+    const doc = await SourceDocument.findById(req.params.id).select("docType status").lean();
+    if (!doc) throw notFound();
+    if (doc.status === "rejected") throw badRequest("REJECTED", "Source écartée");
+    if (doc.docType !== "curriculum") throw badRequest("NOT_CURRICULUM", "Seul un programme se découpe en leçons ; pour un guide ou une fiche modèle, analyse la méthode");
+    const jobId = await startIngest(String(doc._id), me(req).userId);
+    await audit(req, "source.ingest", String(doc._id), { jobId: String(jobId) });
+    res.status(202).json({ jobId });
   })
 );
 
@@ -181,7 +279,12 @@ adminRouter.post(
     try {
       const pdf = await getDocumentProxy(new Uint8Array(file.buffer));
       pageCount = pdf.numPages;
-      text = String((await extractText(pdf, { mergePages: true })).text ?? "");
+      // Texte page par page, avec repères : les leçons extraites citent leurs pages.
+      const pages = (await extractText(pdf, { mergePages: false })).text as string[];
+      text = pages.map((t, i) => `
+
+[[page ${i + 1}]]
+${t ?? ""}`).join("");
     } catch {
       throw badRequest("PDF_UNREADABLE", "Ce PDF ne peut pas être lu (protégé ou abîmé)");
     }
@@ -193,10 +296,10 @@ adminRouter.post(
       sha256,
       pageCount,
       // Texte lisible : prêt pour l'extraction ; PDF scanné : l'IA lira les pages à l'extraction.
-      ...(text.trim().length > 200 ? { extractedText: text.slice(0, 400_000), status: "extracted" } : { status: "fetched" }),
+      ...(text.replace(/[[page d+]]/g, "").trim().length > 200 ? { extractedText: text.slice(0, 2_000_000), status: "extracted" } : { status: "fetched" }),
     });
     await audit(req, "source.upload", String(doc._id), { bytes: file.size, pages: pageCount });
-    res.status(201).json({ ...doc.toObject(), extractedText: undefined, textChars: text.trim().length });
+    res.status(201).json({ ...doc.toObject(), extractedText: undefined, textChars: text.replace(/[[page d+]]/g, "").trim().length });
   })
 );
 
@@ -242,12 +345,39 @@ adminRouter.get(
       subjectCode: z.string().optional(),
       status: z.enum(["extracted", "validated", "retired"]).optional(),
       kind: z.enum(["domain", "unit", "competency", "lesson"]).optional(),
+      sourceId: objectId.optional(),
     }),
     "query"
   ),
   ah(async (req, res) => {
-    const nodes = await CurriculumNode.find({ ...(req.query as Record<string, string>), ownerId: null }).sort({ classLevel: 1, subjectCode: 1, order: 1 }).limit(1000).lean();
+    const { sourceId, ...q } = req.query as Record<string, string>;
+    const filter: Record<string, unknown> = { ...q, ownerId: null };
+    if (sourceId) filter["sourceRefs.sourceId"] = sourceId;
+    const nodes = await CurriculumNode.find(filter).sort({ classLevel: 1, subjectCode: 1, order: 1 }).limit(3000).lean();
     res.json(nodes);
+  })
+);
+
+/**
+ * Validation par lot : tout ce qui a été extrait pour une classe, une matière ou un document, en une fois
+ * (domaines, compétences, unités et leçons). Une seule leçon reste rejetable dans la liste.
+ */
+adminRouter.post(
+  "/nodes/validate",
+  validate(
+    z
+      .object({ classLevel: z.enum(ALL_CLASS_LEVELS).optional(), subjectCode: z.string().max(10).optional(), sourceId: objectId.optional() })
+      .refine((b) => b.classLevel || b.sourceId, "Choisis au moins une classe ou un document")
+  ),
+  ah(async (req, res) => {
+    const b = req.body as { classLevel?: string; subjectCode?: string; sourceId?: string };
+    const filter: Record<string, unknown> = { ownerId: null, status: "extracted" };
+    if (b.classLevel) filter.classLevel = b.classLevel;
+    if (b.subjectCode) filter.subjectCode = b.subjectCode;
+    if (b.sourceId) filter["sourceRefs.sourceId"] = b.sourceId;
+    const out = await CurriculumNode.updateMany(filter, { $set: { status: "validated" } });
+    await audit(req, "node.validate_batch", undefined, { ...b, count: out.modifiedCount });
+    res.json({ validated: out.modifiedCount });
   })
 );
 
@@ -531,7 +661,11 @@ adminRouter.post(
       Subject.find({ subsystem: p.subsystem }).select("code name").lean(),
     ]);
     const sourceIds = [...new Set(lessons.flatMap((l) => (l.sourceRefs ?? []).map((r) => String(r.sourceId))).filter(Boolean))];
-    const docs = await SourceDocument.find(sourceIds.length ? { _id: { $in: sourceIds } } : { _id: null }).select("title issuer status docType publishedOn").lean();
+    // Documents de la classe : ceux dont l'analyse a trouvé cette classe, et ceux d'où viennent les leçons validées.
+    const docs = await SourceDocument.find({ status: { $ne: "rejected" }, $or: [{ _id: { $in: sourceIds } }, { "extraction.classes": p.classLevel }] })
+      .select("title issuer status docType publishedOn extraction")
+      .lean();
+    const analyzing = await SourceDocument.countDocuments({ "extraction.status": "running", status: { $ne: "rejected" } });
     const allSources = await SourceDocument.aggregate<{ _id: string; n: number }>([{ $group: { _id: "$status", n: { $sum: 1 } } }]);
 
     // Ressources déjà présentes (jamais régénérées) et ressources à produire.
@@ -569,7 +703,8 @@ adminRouter.post(
     const names = new Map(subjects.map((x) => [x.code, x.name]));
     const checks: { level: "warn" | "info"; text: string }[] = [];
     const missing = subjects.filter((x) => !bySubject.has(x.code));
-    if (!lessons.length) checks.push({ level: "warn", text: "Aucune leçon validée pour cette classe : importe ou extrais d'abord le programme officiel (Sources), puis valide-le (Référentiel)." });
+    if (analyzing) checks.push({ level: "info", text: `${analyzing} programme(s) en cours d'analyse dans Sources : leurs leçons arriveront « à valider » dans le Référentiel.` });
+    if (!lessons.length) checks.push({ level: "warn", text: pendingLessons ? "Les leçons de cette classe sont extraites mais pas encore validées : valide-les dans le Référentiel (« Tout valider »)." : "Aucune leçon pour cette classe : dépose le programme officiel dans Sources et marque-le « Vérifiée » pour lancer son analyse." });
     if (missing.length && lessons.length) checks.push({ level: "warn", text: `Matières sans leçon validée : ${missing.map((x) => x.name).join(", ")}.` });
     if (pendingLessons) checks.push({ level: "warn", text: `${pendingLessons} leçon(s) extraite(s) attendent ta validation dans le Référentiel (non comptées).` });
     const unverified = docs.filter((d) => d.status !== "verified");
@@ -593,7 +728,7 @@ adminRouter.post(
       checks.push({ level: "warn", text: `Sans méthode officielle validée (démarche générique) : ${noMethod.map((x) => x.name).join(", ")}. Dépose le guide pédagogique ou une fiche modèle dans Sources, puis analyse-le.` });
 
     res.json({
-      documents: docs.map((d) => ({ id: d._id, title: d.title, issuer: d.issuer, status: d.status, docType: d.docType, publishedOn: d.publishedOn ?? null })),
+      documents: docs.map((d) => ({ id: d._id, title: d.title, issuer: d.issuer, status: d.status, docType: d.docType, publishedOn: d.publishedOn ?? null, lessons: d.extraction?.lessons ?? null, analysis: d.extraction?.status ?? null })),
       sources: { verified: allSources.find((x) => x._id === "verified")?.n ?? 0, toVerify: allSources.filter((x) => x._id !== "verified" && x._id !== "rejected").reduce((n, x) => n + x.n, 0) },
       subjects: [...bySubject.entries()].map(([code, r]) => ({ code, name: names.get(code) ?? code, ...r })).sort((a, b) => a.name.localeCompare(b.name)),
       missingSubjects: missing.map((x) => ({ code: x.code, name: x.name })),

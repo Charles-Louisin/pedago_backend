@@ -104,6 +104,26 @@ const sourceDocumentSchema = new Schema(
     pageCount: Number,
     status: { type: String, enum: ["pending", "fetched", "extracted", "verified", "rejected"], default: "pending" },
     notes: String,
+    /**
+     * Ce que l'analyse du document en a tiré (programme officiel) : sous-système, classes, matières, nombre
+     * d'unités et de leçons rangées dans le référentiel. Tout le tableau de bord part de là.
+     */
+    extraction: {
+      status: { type: String, enum: ["running", "done", "failed"] },
+      jobId: { type: Schema.Types.ObjectId, ref: "AiJob" },
+      subsystem: { type: String, enum: ["francophone", "anglophone"] },
+      classes: { type: [String], default: undefined },
+      subjects: { type: [{ _id: false, code: String, name: String }], default: undefined },
+      domains: Number,
+      units: Number,
+      competencies: Number,
+      lessons: Number,
+      pagesRead: Number,
+      containsMethod: Boolean,
+      warnings: { type: [String], default: undefined },
+      error: String,
+      finishedAt: Date,
+    },
   },
   { timestamps: true }
 );

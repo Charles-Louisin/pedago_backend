@@ -33,7 +33,8 @@ export async function connectDb() {
     memoryServer = server;
     await mongoose.connect(server.getUri("pedago"), options);
     const { seedDatabase } = await import("../seed/seed.js");
-    await seedDatabase();
+    // Base locale : pas de données fictives (SEED_DEMO=1 pour les retrouver explicitement).
+    await seedDatabase({ demo: process.env.SEED_DEMO === "1" });
   }
   await migrateRoles();
 }

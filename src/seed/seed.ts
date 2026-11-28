@@ -130,7 +130,17 @@ function demoContent(title: string, objectives: string[], durationMin: number) {
   };
 }
 
-export async function seedDatabase() {
+/**
+ * Hors tests, AUCUNE donnée fictive : matières, classes, unités et leçons viennent uniquement des programmes
+ * déposés dans Sources (et de leur analyse). Seul un compte administrateur est créé s'il n'en existe aucun,
+ * à partir de SEED_ADMIN_EMAIL / SEED_ADMIN_PASSWORD.
+ * Les données de démonstration ne servent qu'aux tests automatisés (ou à SEED_DEMO=1, explicitement).
+ */
+export async function seedDatabase(opts: { demo?: boolean } = {}) {
+  if (opts.demo === false) {
+    await ensureAdmin();
+    return;
+  }
   for (const subsystem of ["francophone", "anglophone"] as const) {
     for (const [i, [code, name, color, icon]] of SUBJECTS[subsystem].entries()) {
       await Subject.updateOne({ subsystem, code }, { name, color, icon, order: i }, { upsert: true });
@@ -266,4 +276,17 @@ export async function seedDatabase() {
   // Rattrapage des tailles de contenu pour les ressources créées avant ce champ.
   await Resource.updateMany({ $or: [{ contentBytes: { $exists: false } }, { contentBytes: 0 }] }, [{ $set: { contentBytes: { $bsonSize: "$content" } } }]);
   logger.info("Données de démonstration prêtes");
+}
+
+/** Premier administrateur d'une base neuve (jamais de mot de passe par défaut hors tests). */
+async function ensureAdmin() {
+  if (await User.exists({ role: "admin" })) return;
+  const email = process.env.SEED_ADMIN_EMAIL?.trim();
+  const password = process.env.SEED_ADMIN_PASSWORD?.trim();
+  if (!email || !password) {
+    logger.warn("Aucun administrateur : renseigne SEED_ADMIN_EMAIL et SEED_ADMIN_PASSWORD puis redémarre");
+    return;
+  }
+  await User.create({ email, fullName: "Administrateur PEDAGO", role: "admin", emailVerified: true, passwordHash: await hashPassword(password) });
+  logger.info({ email }, "Administrateur créé");
 }
