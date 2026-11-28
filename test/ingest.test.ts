@@ -116,3 +116,33 @@ test("base neuve hors tests : aucune donnée fictive (ni matière, ni leçon, ni
   assert.equal(await User.countDocuments({ role: "teacher" }), 0, "aucun enseignant fictif");
   assert.ok((await User.countDocuments({ role: "admin" })) <= 1, "au plus le premier administrateur, tiré de SEED_ADMIN_*");
 });
+
+test("consolidation : unités et leçons en double fusionnées, casse réparée, ordre des pages", async () => {
+  const { consolidateSource, cleanTitle } = await import("../src/ai/ingest.js");
+  assert.equal(cleanTitle("UNIté d’APPRENtIssAgE 1. CENtRE d’INtéRêt — LA MAISON"), "Unité d’apprentissage 1. centre d’intérêt — LA MAISON");
+  assert.equal(cleanTitle("Les nombres de 0 à 10"), "Les nombres de 0 à 10");
+  const src = await SourceDocument.create({ title: "Programme doublons", issuer: "MINEDUB", docType: "curriculum", status: "verified" });
+  const idf = { subsystem: "francophone" as const, classes: ["CE1"], subjects: [{ code: "MATH", name: "Mathématiques" }], version: "2018" };
+  const item = (unit: string, title: string, pages: number[], competency?: string) => ({
+    classes: ["CE1"], subject: "Mathématiques",
+    path: [...(competency ? [{ kind: "competency" as const, title: competency, label: null }] : []), { kind: "unit" as const, title: unit, label: null }],
+    lesson: { title, objectives: [`Objectif ${title} ${pages[0]}`], durationMin: null, term: null, week: null, period: null }, pages,
+  });
+  // Même unité écrite de deux façons, avec et sans compétence au-dessus : deux unités et des leçons en double.
+  await storeChunkItems(String(src._id), idf, [item("UNIté 1 — LA MAISON", "Les ensembles", [10], "Résoudre des problèmes"), item("UNIté 1 — LA MAISON", "Calcul mental", [11], "Résoudre des problèmes")]);
+  await storeChunkItems(String(src._id), idf, [item("Unité 1 — la maison", "Les ensembles", [12]), item("Unité 1 — la maison", "Les nombres de 100 à 200", [9])]);
+  assert.equal(await CurriculumNode.countDocuments({ "sourceRefs.sourceId": src._id, kind: "unit" }), 2);
+
+  const out = await consolidateSource(String(src._id));
+  assert.ok(out.merged >= 2);
+  const units = await CurriculumNode.find({ "sourceRefs.sourceId": src._id, kind: "unit" }).lean();
+  assert.equal(units.length, 1, "une seule unité");
+  assert.equal(units[0].title, "Unité 1 — LA MAISON");
+  assert.ok(units[0].parentId, "l'unité garde sa compétence");
+  const lessons = await CurriculumNode.find({ "sourceRefs.sourceId": src._id, kind: "lesson" }).sort({ order: 1 }).lean();
+  assert.deepEqual(lessons.map((l) => l.title), ["Les nombres de 100 à 200", "Les ensembles", "Calcul mental"], "dans l'ordre des pages");
+  assert.ok(lessons.every((l) => String(l.parentId) === String(units[0]._id)), "toutes rattachées à l'unité gardée");
+  const ens = lessons.find((l) => l.title === "Les ensembles")!;
+  assert.deepEqual(ens.sourceRefs[0].pages, [10, 12]);
+  assert.equal(ens.objectives.length, 2, "objectifs réunis");
+});

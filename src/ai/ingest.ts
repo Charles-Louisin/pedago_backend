@@ -21,6 +21,8 @@ export const INGEST_STEPS = ["ingest_read", "ingest_identify"] as const;
 const INGEST_V1 = "ingest.v1";
 // v2 : leçons regroupées par chemin (réponse plus courte), passage redécoupé si la réponse est coupée.
 const INGEST_V2 = "ingest.v2";
+// v3 : une leçon n'est attribuée qu'à la classe de sa colonne (tableaux CE1 | CE2 aux contenus différents).
+const INGEST_V3 = "ingest.v3";
 /** Taille d'un morceau envoyé au modèle (caractères), et recouvrement d'une page entre deux morceaux. */
 const CHUNK_CHARS = 24_000;
 const PAGE_MARK = (n: number) => `\n\n[[page ${n}]]\n`;
@@ -184,7 +186,7 @@ export async function extractPart(jobId: string, idf: Idf, full: string, part: P
     jobId,
     step: "ingest_chunk",
     model: env.aiModelExtract,
-    promptVersion: INGEST_V2,
+    promptVersion: INGEST_V3,
     json: true,
     temperature: 0,
     maxTokens: 32_000,
@@ -200,7 +202,13 @@ Relève chaque leçon (ou contenu d'apprentissage enseigné en une séance) pré
   (compétence), "unit" (unité, séquence, module, thème), "title": "…", "label": "Unité 3" ou "Séquence 2" si écrit} ;
 - dans le groupe, ses leçons dans l'ordre : {"title", "objectives" (objectifs écrits, 5 au plus, tels qu'écrits),
   "durationMin" (si écrite), "term" (trimestre 1-3 si écrit), "week", "period", "pages" (numéros [[page N]])}.
-Une leçon commune à plusieurs classes n'apparaît qu'une fois, avec toutes ses classes. N'écris pas les champs vides inutiles.
+CLASSES — très important : le programme présente souvent un tableau à une colonne par classe (par exemple CE1 | CE2),
+avec des contenus DIFFÉRENTS d'une colonne à l'autre. Dans le texte extrait, les colonnes alternent ligne par ligne :
+la 1re cellule d'une ligne appartient à la 1re classe de l'en-tête, la suivante à la 2e. Attribue chaque leçon à la seule
+classe de SA colonne (repère aussi les nombres, niveaux de difficulté et objectifs : ils diffèrent d'une classe à l'autre).
+Ne donne plusieurs classes à une leçon que si le document l'indique explicitement pour toutes ces classes.
+Quand le même intitulé existe dans deux colonnes avec des objectifs différents, crée une leçon par classe avec ses objectifs.
+N'écris pas les champs vides inutiles.
 Ignore sommaire, préface, textes officiels et généralités sans contenu de leçon. Sans aucune leçon, renvoie {"groups": []}.
 Réponds UNIQUEMENT en JSON : {"groups":[{"subject":"…","classes":["…"],"path":[{"kind":"unit","title":"…","label":null}],
 "lessons":[{"title":"…","objectives":["…"],"pages":[1]}]}]}
@@ -228,6 +236,112 @@ Réponds UNIQUEMENT en JSON : {"groups":[{"subject":"…","classes":["…"],"pat
     }
     throw err instanceof TooLongError ? new Error(`Passage trop dense même découpé (${where}) : réponse du modèle incomplète`) : err;
   }
+}
+
+/* ───────── Consolidation après analyse (sans IA) ───────── */
+
+/**
+ * Casse abîmée par l'extraction du PDF (« UNIté d'APPRENtIssAgE ») : un mot dont une majuscule suit une
+ * minuscule est remis en minuscules ; l'intitulé garde sa majuscule initiale. Les mots normaux sont intacts.
+ */
+export function cleanTitle(t: string) {
+  const fixed = t
+    .split(/(\s+)/)
+    // Majuscule après une minuscule (« APPRENtIssAgE »), ou majuscules suivies de minuscules (« UNIté »).
+    .map((w) => (/\p{Ll}\p{Lu}/u.test(w) || /^\p{Lu}{2,}\p{Ll}/u.test(w) ? w.toLowerCase() : w))
+    .join("")
+    .replace(/\s+/g, " ")
+    .trim();
+  return fixed.charAt(0).toUpperCase() + fixed.slice(1);
+}
+
+/**
+ * Fusionne ce qu'une analyse découpée a créé en double : domaines, compétences et unités de même intitulé
+ * (majuscules, accents et ponctuation ignorés) dans une classe et une matière, puis leçons de même intitulé
+ * sous une même unité (pages et objectifs réunis). Renumérote dans l'ordre des pages du document.
+ * Ne touche qu'aux éléments encore « à valider » de cette source.
+ */
+export async function consolidateSource(sourceId: string) {
+  const sid = new Types.ObjectId(sourceId);
+  const all = await CurriculumNode.find({ ownerId: null, "sourceRefs.sourceId": sid, status: "extracted" }).lean();
+  const pageOf = (n: { sourceRefs?: { pages?: number[] }[] }) => Math.min(...(n.sourceRefs?.[0]?.pages?.length ? n.sourceRefs[0].pages : [99999]));
+
+  const redirect = new Map<string, string>();
+  const root = (id: string) => {
+    let cur = id;
+    while (redirect.has(cur)) cur = redirect.get(cur)!;
+    return cur;
+  };
+  let merged = 0;
+  // Écritures groupées par lots : quelques requêtes au lieu d'une par élément (base distante).
+  const writes: Parameters<typeof CurriculumNode.bulkWrite>[0] = [];
+  const flush = async () => {
+    for (let i = 0; i < writes.length; i += 500) await CurriculumNode.bulkWrite(writes.slice(i, i + 500), { ordered: false });
+    writes.length = 0;
+  };
+
+  // 1. Niveaux du chemin : un seul nœud par (classe, matière, type, intitulé normalisé).
+  for (const kind of ["domain", "competency", "unit"] as const) {
+    const groups = new Map<string, typeof all>();
+    for (const n of all.filter((x) => x.kind === kind)) {
+      const key = `${n.classLevel}|${n.subjectCode}|${norm(n.title)}`;
+      groups.set(key, [...(groups.get(key) ?? []), n]);
+    }
+    for (const list of groups.values()) {
+      list.sort((a, b) => pageOf(a) - pageOf(b) || a.order - b.order);
+      const keep = list.find((n) => n.parentId) ?? list[0];
+      for (const d of list) if (d._id !== keep._id) redirect.set(String(d._id), String(keep._id));
+      merged += list.length - 1;
+      const pages = [...new Set(list.flatMap((n) => n.sourceRefs?.[0]?.pages ?? []))].sort((a, b) => a - b);
+      writes.push({ updateOne: { filter: { _id: keep._id }, update: { $set: { title: cleanTitle(keep.title), ...(keep.label ? { label: cleanTitle(keep.label) } : {}), "sourceRefs.0.pages": pages.slice(0, 50) } } } });
+    }
+  }
+  // Rattachements : chaque enfant pointe vers le nœud gardé ; un nœud ne se rattache jamais à lui-même.
+  for (const n of all) {
+    if (!n.parentId) continue;
+    const target = root(String(n.parentId));
+    if (target !== String(n.parentId) && target !== root(String(n._id))) writes.push({ updateOne: { filter: { _id: n._id }, update: { $set: { parentId: new Types.ObjectId(target) } } } });
+  }
+  await flush();
+  if (redirect.size) await CurriculumNode.deleteMany({ _id: { $in: [...redirect.keys()].map((id) => new Types.ObjectId(id)) } });
+
+  // 2. Leçons : une seule par (classe, matière, unité, intitulé normalisé), pages et objectifs réunis.
+  const lessons = await CurriculumNode.find({ ownerId: null, "sourceRefs.sourceId": sid, status: "extracted", kind: "lesson" }).lean();
+  const groups = new Map<string, typeof lessons>();
+  for (const l of lessons) {
+    const key = `${l.classLevel}|${l.subjectCode}|${l.parentId ?? ""}|${norm(l.title)}`;
+    groups.set(key, [...(groups.get(key) ?? []), l]);
+  }
+  const drop: unknown[] = [];
+  for (const list of groups.values()) {
+    if (list.length === 1) continue;
+    list.sort((a, b) => pageOf(a) - pageOf(b) || a.order - b.order);
+    const [keep, ...rest] = list;
+    const pages = [...new Set(list.flatMap((n) => n.sourceRefs?.[0]?.pages ?? []))].sort((a, b) => a - b);
+    const objectives: string[] = [];
+    for (const o of list.flatMap((n) => n.objectives ?? [])) if (!objectives.some((x) => norm(x) === norm(o))) objectives.push(o);
+    writes.push({ updateOne: { filter: { _id: keep._id }, update: { $set: { "sourceRefs.0.pages": pages.slice(0, 50), objectives: objectives.slice(0, 15) } } } });
+    drop.push(...rest.map((r) => r._id));
+    merged += rest.length;
+  }
+  await flush();
+  if (drop.length) await CurriculumNode.deleteMany({ _id: { $in: drop } });
+
+  // 3. Ordre : celui des pages du document, par classe et matière ; intitulés de leçons réparés.
+  const left = await CurriculumNode.find({ ownerId: null, "sourceRefs.sourceId": sid, status: "extracted" }).lean();
+  const byScope = new Map<string, typeof left>();
+  for (const n of left) {
+    const key = `${n.classLevel}|${n.subjectCode}|${n.kind}`;
+    byScope.set(key, [...(byScope.get(key) ?? []), n]);
+  }
+  const ops: Parameters<typeof CurriculumNode.bulkWrite>[0] = [];
+  for (const list of byScope.values()) {
+    list.sort((a, b) => pageOf(a) - pageOf(b) || a.order - b.order);
+    list.forEach((n, i) => ops.push({ updateOne: { filter: { _id: n._id }, update: { $set: { order: i + 1, title: cleanTitle(n.title) } } } }));
+  }
+  for (let i = 0; i < ops.length; i += 500) await CurriculumNode.bulkWrite(ops.slice(i, i + 500), { ordered: false });
+
+  return { merged, remaining: left.length };
 }
 
 export const ingestHandlers = {
@@ -334,6 +448,8 @@ Réponds UNIQUEMENT en JSON :
   async ingest_finish({ job, outputs }: Ctx) {
     const p = ingestParams.parse(job.params);
     const idf = outputs.ingest_identify as { subsystem: string; classes: string[]; subjects: { code: string; name: string }[]; containsMethod: boolean; warnings: string[] };
+    // Doublons créés d'une partie à l'autre (intitulés légèrement différents) fusionnés avant le bilan.
+    await consolidateSource(p.sourceId);
     const count = (kind: string) => CurriculumNode.countDocuments({ ownerId: null, "sourceRefs.sourceId": p.sourceId, kind, status: { $ne: "retired" } });
     const [domains, units, competencies, lessons] = await Promise.all([count("domain"), count("unit"), count("competency"), count("lesson")]);
     const present = await CurriculumNode.distinct("subjectCode", { ownerId: null, "sourceRefs.sourceId": p.sourceId });
